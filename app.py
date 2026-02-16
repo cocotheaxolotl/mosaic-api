@@ -99,12 +99,24 @@ def _check_quota(request: Request, promo: Optional[dict] = None) -> int:
     return max(0, remaining)
 
 
+_last_gen: dict[str, float] = {}   # ip_key → last generation timestamp
+
 def _consume(request: Request, n: int = 1):
-    """Consume n quota units and increment global counter."""
+    """Consume n quota units and increment global counter.
+    Dedup: if same IP generated within last 60s, don't count again.
+    """
     global _total_generated
     key = _user_key(request)
+    now = time.time()
+
+    # Dedup: don't double-count rapid successive calls (preview + zip)
+    if key in _last_gen and now - _last_gen[key] < 60:
+        _last_gen[key] = now
+        return
+
+    _last_gen[key] = now
     if key not in _usage:
-        _usage[key] = {"count": 0, "first": time.time()}
+        _usage[key] = {"count": 0, "first": now}
     _usage[key]["count"] += n
     _total_generated += n
 
