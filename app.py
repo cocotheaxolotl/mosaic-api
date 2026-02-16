@@ -23,8 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 
 from mosaic_engine import (
-    generate, generate_from_preset, images_to_zip,
-    PRESETS, MosaicResult,
+    generate, generate_voronoi, generate_from_preset, images_to_zip,
+    PRESETS, VORONOI_DENSITIES, MosaicResult,
 )
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -159,6 +159,8 @@ def list_presets():
             "cell_size": p.cell_size,
             "colors": p.colors,
             "landscape": p.landscape,
+            "mode": p.mode,
+            "voronoi_density": p.voronoi_density if p.mode == "voronoi" else None,
         }
         for name, p in PRESETS.items()
     }
@@ -179,16 +181,21 @@ async def generate_mosaic(
     colors: int = Form(12),
     cell_size: int = Form(25),
     page: str = Form("letter"),
-    output: str = Form("zip"),   # "zip" | "mystery" | "answer" | "legend" | "full"
+    output: str = Form("zip"),   # "zip" | "mystery" | "answer" | "legend" | "full" | "beauty"
+    mode: str = Form("hex"),     # "hex" | "voronoi"
+    density: str = Form("standard"),  # voronoi density: easy/standard/detailed/expert
     promo_code: Optional[str] = Form(None),
 ):
     """Generate a mystery mosaic from a single uploaded image.
 
-    - Use `preset` for quick configuration (overrides colors/cell_size/page).
+    - Use `preset` for quick configuration (overrides all other params).
+    - `mode` = "hex" (default grid) or "voronoi" (organic cells).
+    - `density` = voronoi density preset: easy/standard/detailed/expert.
     - `output` controls what you get back:
-      - "zip"     → ZIP with all 4 files (default)
+      - "zip"     → ZIP with all files (default)
       - "mystery" → just the mystery page PNG
       - "answer"  → just the answer key PNG
+      - "beauty"  → beauty preview PNG
       - "legend"  → just the legend PNG
       - "full"    → mystery + legend combined PNG
     """
@@ -219,6 +226,11 @@ async def generate_mosaic(
     # Generate
     if preset and preset in PRESETS:
         result = generate_from_preset(img, preset)
+    elif mode == "voronoi":
+        colors = max(4, min(20, colors))
+        density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
+        num_cells = density_map.get(density, density_map["standard"])
+        result = generate_voronoi(img, colors=colors, density=num_cells, page=page)
     else:
         colors = max(4, min(20, colors))
         cell_size = max(12, min(50, cell_size))
@@ -251,6 +263,8 @@ async def bulk_generate(
     colors: int = Form(12),
     cell_size: int = Form(25),
     page: str = Form("letter"),
+    mode: str = Form("hex"),
+    density: str = Form("standard"),
     promo_code: Optional[str] = Form(None),
 ):
     """Generate mosaics for multiple images at once → returns a ZIP.
@@ -292,6 +306,11 @@ async def bulk_generate(
 
         if preset and preset in PRESETS:
             res = generate_from_preset(img, preset)
+        elif mode == "voronoi":
+            density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
+            num_cells = density_map.get(density, density_map["standard"])
+            res = generate_voronoi(img, colors=max(4, min(20, colors)),
+                                   density=num_cells, page=page)
         else:
             res = generate(img, colors=max(4, min(20, colors)),
                            cell_size=max(12, min(50, cell_size)), page=page)
