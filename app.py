@@ -33,6 +33,9 @@ FREE_LIMIT = 3                # free generations per user
 MAX_BULK = 50                 # max images in one bulk request
 MAX_IMAGE_SIZE = 10_000_000   # 10 MB per image
 ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp"}
+PROMO_CODES = {
+    os.environ.get("PROMO_UNLIMITED", "COCO-ADMIN-2026"): {"limit": 999999, "label": "unlimited"},
+}
 
 # ── App ──────────────────────────────────────────────────────────────────
 
@@ -67,8 +70,18 @@ def _user_key(request: Request) -> str:
     return hashlib.sha256(ip.encode()).hexdigest()[:16]
 
 
-def _check_quota(request: Request) -> int:
+def _check_promo(code: Optional[str]) -> Optional[dict]:
+    """Check if a promo code is valid. Returns promo info or None."""
+    if code and code.strip() in PROMO_CODES:
+        return PROMO_CODES[code.strip()]
+    return None
+
+
+def _check_quota(request: Request, promo: Optional[dict] = None) -> int:
     """Return remaining free uses.  Raises 429 if exhausted."""
+    if promo:
+        return promo["limit"]
+
     key = _user_key(request)
     now = time.time()
     rec = _usage.get(key)
@@ -155,6 +168,7 @@ async def generate_mosaic(
     cell_size: int = Form(25),
     page: str = Form("letter"),
     output: str = Form("zip"),   # "zip" | "mystery" | "answer" | "legend" | "full"
+    promo_code: Optional[str] = Form(None),
 ):
     """Generate a mystery mosaic from a single uploaded image.
 
@@ -167,7 +181,8 @@ async def generate_mosaic(
       - "full"    → mystery + legend combined PNG
     """
     # Quota check
-    remaining = _check_quota(request)
+    promo = _check_promo(promo_code)
+    remaining = _check_quota(request, promo)
     if remaining <= 0:
         raise HTTPException(
             status_code=429,
@@ -222,6 +237,7 @@ async def bulk_generate(
     colors: int = Form(12),
     cell_size: int = Form(25),
     page: str = Form("letter"),
+    promo_code: Optional[str] = Form(None),
 ):
     """Generate mosaics for multiple images at once → returns a ZIP.
 
@@ -235,7 +251,8 @@ async def bulk_generate(
         raise HTTPException(400, "No images provided")
 
     # Quota check
-    remaining = _check_quota(request)
+    promo = _check_promo(promo_code)
+    remaining = _check_quota(request, promo)
     if remaining < n:
         raise HTTPException(
             status_code=429,
