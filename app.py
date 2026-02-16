@@ -46,6 +46,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://cocotheaxolotl.org",
+        "https://www.cocotheaxolotl.org",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
     ],
