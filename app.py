@@ -232,6 +232,8 @@ async def generate_mosaic(
         return _img_to_streaming(result.mystery, f"{name}-mystery.png")
     if output == "answer":
         return _img_to_streaming(result.answer, f"{name}-answer.png")
+    if output == "beauty":
+        return _img_to_streaming(result.beauty, f"{name}-beauty.png")
     if output == "legend":
         return _img_to_streaming(result.legend, f"{name}-legend.png")
     if output == "full":

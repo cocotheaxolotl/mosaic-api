@@ -114,6 +114,18 @@ def _sample(label_map, cx, cy, cell, w, h):
     return np.bincount(region.flatten()).argmax() if region.size else 0
 
 
+def _sample_avg_color(pixels, cx, cy, cell, w, h):
+    """Sample the average RGB color in a region around (cx, cy)."""
+    r = max(2, int(cell * 0.45))
+    ys, ye = max(0, int(cy) - r), min(h, int(cy) + r)
+    xs, xe = max(0, int(cx) - r), min(w, int(cx) + r)
+    if ys >= ye or xs >= xe:
+        return (200, 200, 200)
+    region = pixels[ys:ye, xs:xe]
+    avg = region.reshape(-1, 3).mean(axis=0).astype(np.uint8)
+    return tuple(int(c) for c in avg)
+
+
 # ── Page sizes ───────────────────────────────────────────────────────────
 
 PAGE_SIZES = {
@@ -149,7 +161,8 @@ PRESETS = {
 @dataclass
 class MosaicResult:
     mystery: Image.Image       # numbered hexagons (B/W)
-    answer: Image.Image        # coloured answer key
+    answer: Image.Image        # coloured answer key (quantized palette)
+    beauty: Image.Image        # beauty answer (real avg colors, no outlines)
     legend: Image.Image        # colour legend strip
     mystery_full: Image.Image  # mystery + legend combined
     hex_count: int
@@ -220,12 +233,21 @@ def generate(
         dm.text((cx - (bb[2] - bb[0]) / 2, cy - (bb[3] - bb[1]) / 2),
                 num, fill=(80, 80, 80), font=font)
 
-    # ── Answer key (coloured) ──
+    # ── Answer key (coloured, quantized palette) ──
     answer = Image.new("RGB", (w, h), (255, 255, 255))
     da = ImageDraw.Draw(answer)
     for cx, cy, ci in hex_data:
         da.polygon(_hex_vertices(cx, cy, cell_size),
                    outline=(40, 40, 40), fill=tuple(palette[ci]), width=1)
+
+    # ── Beauty answer (real average colors, no outlines — for preview) ──
+    pixels = np.array(img)
+    beauty = Image.new("RGB", (w, h), (255, 255, 255))
+    db = ImageDraw.Draw(beauty)
+    for cx, cy in centers:
+        avg_color = _sample_avg_color(pixels, cx, cy, cell_size, w, h)
+        db.polygon(_hex_vertices(cx, cy, cell_size),
+                   fill=avg_color, outline=avg_color)
 
     # ── Legend ──
     legend = _make_legend(palette, w)
@@ -238,6 +260,7 @@ def generate(
     return MosaicResult(
         mystery=mystery,
         answer=answer,
+        beauty=beauty,
         legend=legend,
         mystery_full=mystery_full,
         hex_count=len(hex_data),
@@ -302,6 +325,7 @@ def images_to_zip(results: List[Tuple[str, MosaicResult]]) -> bytes:
                 ("mystery", res.mystery),
                 ("mystery-full", res.mystery_full),
                 ("answer", res.answer),
+                ("beauty", res.beauty),
                 ("legend", res.legend),
             ]:
                 img_buf = io.BytesIO()
