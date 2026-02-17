@@ -50,8 +50,11 @@ app.add_middleware(
     allow_origins=[
         "https://cocotheaxolotl.org",
         "https://www.cocotheaxolotl.org",
+        "https://univers.studio",
+        "https://www.univers.studio",
         "http://localhost:8000",
         "http://127.0.0.1:8000",
+        "http://localhost:3000",
     ],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
