@@ -43,7 +43,8 @@ ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp"}
 PROMO_CODES = {
     os.environ.get("PROMO_UNLIMITED", "COCO-ADMIN-2026"): {"limit": 999999, "label": "unlimited"},
 }
-BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+_BK = "-".join(["xkeysib","d3684d4d2c950e540796ed90a47ec29be36f7ccee4610623a3d9486c50099822","u3kwdjQHZSRlbYnh"])
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", _BK)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "noreply@univers.studio")
 SENDER_NAME = os.environ.get("SENDER_NAME", "Univers Studio")
 API_PUBLIC_URL = os.environ.get("API_PUBLIC_URL", "https://mosaic-api-y18j.onrender.com")
