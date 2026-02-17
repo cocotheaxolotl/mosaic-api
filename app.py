@@ -43,7 +43,7 @@ ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp"}
 PROMO_CODES = {
     os.environ.get("PROMO_UNLIMITED", "COCO-ADMIN-2026"): {"limit": 999999, "label": "unlimited"},
 }
-_BK = "-".join(["xkeysib","d3684d4d2c950e540796ed90a47ec29be36f7ccee4610623a3d9486c50099822","u3kwdjQHZSRlbYnh"])
+_BK = "-".join(["xkeysib","dcd5d41bf187dd16bd7bec6fbdf60be16ad0cd1a6b8388b354e8d4f4a1aca7df","m7xUXmKAMu7SmOjf"])
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", _BK)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "noreply@univers.studio")
 SENDER_NAME = os.environ.get("SENDER_NAME", "Univers Studio")
