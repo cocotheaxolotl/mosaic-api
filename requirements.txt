@@ -4,4 +4,4 @@ python-multipart==0.0.9
 Pillow==10.4.0
 scikit-learn==1.5.1
 numpy==1.26.4
-scipy==1.13.1
+# scipy==1.13.1  # optional: only needed for Voronoi mode, heavy (~150 MB)

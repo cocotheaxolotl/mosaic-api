@@ -294,7 +294,10 @@ def _build_voronoi_cells(w: int, h: int, density: int):
     Returns list of (clipped_verts, area, label_point, seed_x, seed_y)
     for cells with area >= _VORONOI_SKIP_AREA.
     """
-    from scipy.spatial import Voronoi as _Voronoi
+    try:
+        from scipy.spatial import Voronoi as _Voronoi
+    except ImportError:
+        raise RuntimeError("Voronoi mode requires scipy. Install with: pip install scipy")
     pts = _voronoi_points(w, h, density)
     vor = _Voronoi(pts)
 
