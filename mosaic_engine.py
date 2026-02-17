@@ -3,6 +3,7 @@ Mystery Mosaic Engine — Core generation logic (no CLI, no file I/O).
 Called by the FastAPI app.  Returns PIL Images in memory.
 """
 
+import gc
 import io
 import math
 import zipfile
@@ -12,7 +13,7 @@ from typing import List, Tuple, Optional
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
 from sklearn.cluster import KMeans
-from scipy.spatial import Voronoi
+# scipy is lazy-imported in _build_voronoi_cells() to save ~150 MB RAM at startup
 
 
 # ── Fonts ────────────────────────────────────────────────────────────────
@@ -293,8 +294,9 @@ def _build_voronoi_cells(w: int, h: int, density: int):
     Returns list of (clipped_verts, area, label_point, seed_x, seed_y)
     for cells with area >= _VORONOI_SKIP_AREA.
     """
+    from scipy.spatial import Voronoi as _Voronoi
     pts = _voronoi_points(w, h, density)
-    vor = Voronoi(pts)
+    vor = _Voronoi(pts)
 
     cells = []
     for idx, region_idx in enumerate(vor.point_region):
@@ -480,6 +482,7 @@ def generate(
 
     pal_list = [tuple(int(c) for c in row) for row in palette]
 
+    gc.collect()
     return MosaicResult(
         mystery=mystery,
         answer=answer,
@@ -619,6 +622,7 @@ def generate_voronoi(
 
     pal_list = [tuple(int(c) for c in row) for row in palette]
 
+    gc.collect()
     return MosaicResult(
         mystery=mystery,
         answer=answer,
