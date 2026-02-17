@@ -47,7 +47,7 @@ _BK = "-".join(["xkeysib","dcd5d41bf187dd16bd7bec6fbdf60be16ad0cd1a6b8388b354e8d
 BREVO_API_KEY = os.environ.get("BREVO_API_KEY", _BK)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "noreply@univers.studio")
 SENDER_NAME = os.environ.get("SENDER_NAME", "Univers Studio")
-API_PUBLIC_URL = os.environ.get("API_PUBLIC_URL", "https://mosaic-api-y18j.onrender.com")
+API_PUBLIC_URL = os.environ.get("API_PUBLIC_URL", "https://mosaic-api.fly.dev")
 DOWNLOAD_TTL = 3600        # download links expire after 1 hour
 DOWNLOAD_MAX_ENTRIES = 15   # max ZIPs stored in memory
 
