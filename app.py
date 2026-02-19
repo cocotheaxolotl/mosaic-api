@@ -10,6 +10,17 @@ Endpoints:
     GET  /api/download/{token}  — serve stored ZIP from email link
     GET  /api/presets           — list available presets
     GET  /api/quota             — check remaining free uses
+    POST /api/auth/signup       — create account
+    POST /api/auth/login        — sign in
+    POST /api/auth/refresh      — refresh JWT
+    POST /api/auth/logout       — invalidate refresh token
+    GET  /api/auth/me           — current user profile + credits
+    POST /api/auth/verify-email — verify email token
+    POST /api/auth/forgot       — request password reset
+    POST /api/auth/reset        — reset password with token
+    POST /api/credits/consume   — consume 1 credit (for name generators)
+    GET  /api/credits/balance   — current credit balance
+    GET  /api/credits/history   — transaction history
 """
 
 import io
@@ -20,18 +31,26 @@ import json
 import time
 import uuid
 import hashlib
+import asyncio
 import urllib.request
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Body
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from PIL import Image
 
+from database import init_db
+import auth as auth_module
+import credits as credits_module
+import stripe_integration
+
 from mosaic_engine import (
-    generate, generate_voronoi, generate_from_preset, images_to_zip,
-    PRESETS, VORONOI_DENSITIES, MosaicResult,
+    generate, generate_voronoi, generate_cbn, generate_line_art,
+    generate_from_preset, images_to_zip,
+    PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, LineArtResult,
 )
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -39,6 +58,9 @@ from mosaic_engine import (
 FREE_LIMIT = 3                # free generations per user
 MAX_BULK = 50                 # max images in one bulk request
 MAX_IMAGE_SIZE = 10_000_000   # 10 MB per image
+
+# Semaphore: only 1 generation at a time to prevent OOM on 2GB VM
+_gen_semaphore = asyncio.Semaphore(1)
 ALLOWED_TYPES = {"image/png", "image/jpeg", "image/webp"}
 PROMO_CODES = {
     os.environ.get("PROMO_UNLIMITED", "COCO-ADMIN-2026"): {"limit": 999999, "label": "unlimited"},
@@ -74,7 +96,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Simple in-memory stores (replace with Redis/DB in production) ──
+# ── Startup ──────────────────────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup():
+    await init_db()
+
+
+# ── Auth helper ──────────────────────────────────────────────────────────
+
+async def get_user_or_ip(request: Request) -> tuple[int | None, str]:
+    """
+    Identify the caller. If Bearer token present and valid, returns (user_id, "user:<id>").
+    Otherwise falls back to IP-based identification: (None, "ip:<hash>").
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        payload = auth_module.decode_access_token(token)
+        if payload:
+            user_id = payload["sub"]
+            return (user_id, f"user:{user_id}")
+    return (None, f"ip:{_user_key(request)}")
+
+
+# ── Simple in-memory stores (fallback for anonymous users) ──
 
 _usage: dict[str, dict] = {}   # ip → {"count": int, "first": timestamp}
 _total_generated: int = 0       # global generation counter
@@ -117,7 +163,8 @@ def _check_quota(request: Request, promo: Optional[dict] = None) -> int:
 
 
 _last_gen: dict[str, float] = {}   # ip_key → last generation timestamp
-_download_store: dict[str, dict] = {}  # token → {zip_bytes, filename, created_at}
+DOWNLOAD_DIR = Path("/tmp/mosaic-downloads")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 def _consume(request: Request, n: int = 1):
     """Consume n quota units and increment global counter.
@@ -142,7 +189,12 @@ def _consume(request: Request, n: int = 1):
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 def _read_image(data: bytes) -> Image.Image:
-    return Image.open(io.BytesIO(data)).convert("RGB")
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    # Cap input to 1500px on longest side to save RAM on 2GB VM
+    MAX_DIM = 1500
+    if max(img.size) > MAX_DIM:
+        img.thumbnail((MAX_DIM, MAX_DIM), Image.LANCZOS)
+    return img
 
 
 def _img_to_streaming(img: Image.Image, filename: str) -> StreamingResponse:
@@ -156,13 +208,99 @@ def _img_to_streaming(img: Image.Image, filename: str) -> StreamingResponse:
     )
 
 
-def _result_to_zip_stream(name: str, res: MosaicResult) -> StreamingResponse:
+def _result_to_zip_stream(name: str, res) -> StreamingResponse:
     data = images_to_zip([(name, res)])
+    if isinstance(res, LineArtResult):
+        label = "lineart"
+    elif isinstance(res, CBNResult):
+        label = "cbn"
+    else:
+        label = "mosaic"
     return StreamingResponse(
         io.BytesIO(data),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{name}-mosaic.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{name}-{label}.zip"'},
     )
+
+
+def _svg_to_streaming(svg_str: str, filename: str) -> StreamingResponse:
+    return StreamingResponse(
+        io.BytesIO(svg_str.encode("utf-8")),
+        media_type="image/svg+xml",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ── AI Coloring Page (OpenAI) ────────────────────────────────────────────
+
+import base64
+import httpx
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+
+
+async def _ai_coloring_page(image_data: bytes) -> Image.Image:
+    """Generate a coloring page using OpenAI: Vision describes the image, then GPT Image generates line art."""
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OpenAI API key not configured")
+
+    # Step 1: Describe the image with GPT-4o-mini vision
+    b64_img = base64.b64encode(image_data).decode("utf-8")
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        vision_resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": "gpt-4o-mini",
+                "max_tokens": 200,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Describe this image in one short sentence for generating a coloring page. Focus on the main subject, its pose, and any accessories. Be concise. Example: 'a cute baby leopard wearing a beanie hat, sitting and looking forward'",
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{b64_img}", "detail": "low"},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+        if vision_resp.status_code != 200:
+            raise HTTPException(502, f"Vision API error: {vision_resp.text[:200]}")
+        description = vision_resp.json()["choices"][0]["message"]["content"].strip()
+
+    # Step 2: Generate coloring page with GPT Image 1 Mini
+    prompt = (
+        f"Simple black and white coloring page for children. "
+        f"Bold clean outlines, no shading, no gray tones, no colors, pure white background. "
+        f"Subject: {description}. "
+        f"Style: cute cartoon illustration with clear thick outlines, suitable for kids to color with crayons."
+    )
+
+    async with httpx.AsyncClient(timeout=90) as client:
+        img_resp = await client.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": "gpt-image-1",
+                "prompt": prompt,
+                "n": 1,
+                "size": "1024x1024",
+                "quality": "low",
+            },
+        )
+        if img_resp.status_code != 200:
+            raise HTTPException(502, f"Image API error: {img_resp.text[:200]}")
+
+        img_b64 = img_resp.json()["data"][0]["b64_json"]
+        img_bytes = base64.b64decode(img_b64)
+        return Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────
@@ -179,16 +317,29 @@ def list_presets():
             "landscape": p.landscape,
             "mode": p.mode,
             "voronoi_density": p.voronoi_density if p.mode == "voronoi" else None,
+            "min_zone_pixels": p.min_zone_pixels if p.mode == "cbn" else None,
+            "lineart_detail": p.lineart_detail if p.mode == "lineart" else None,
+            "lineart_thickness": p.lineart_thickness if p.mode == "lineart" else None,
         }
         for name, p in PRESETS.items()
     }
 
 
 @app.get("/api/quota")
-def check_quota(request: Request):
-    """Check how many free generations remain."""
+async def check_quota(request: Request):
+    """Check how many generations remain (authenticated or anonymous)."""
+    user_id, _ = await get_user_or_ip(request)
+    if user_id:
+        info = await credits_module.get_plan_info(user_id)
+        if info:
+            return {
+                "remaining": info["balance"],
+                "limit": info["monthly_quota"],
+                "plan": info["plan_name"],
+                "authenticated": True,
+            }
     remaining = _check_quota(request)
-    return {"remaining": remaining, "limit": FREE_LIMIT}
+    return {"remaining": remaining, "limit": FREE_LIMIT, "authenticated": False}
 
 
 @app.post("/api/generate")
@@ -200,35 +351,54 @@ async def generate_mosaic(
     cell_size: int = Form(25),
     page: str = Form("letter"),
     output: str = Form("zip"),   # "zip" | "mystery" | "answer" | "legend" | "full" | "beauty"
-    mode: str = Form("hex"),     # "hex" | "voronoi"
+    mode: str = Form("hex"),     # "hex" | "voronoi" | "cbn" | "lineart" | "ai"
     density: str = Form("standard"),  # voronoi density: easy/standard/detailed/expert
+    detail: str = Form("standard"),   # lineart detail: simple/standard/detailed/expert
+    thickness: int = Form(2),         # lineart line thickness: 1-4
     promo_code: Optional[str] = Form(None),
 ):
-    """Generate a mystery mosaic from a single uploaded image.
+    """Generate a mystery mosaic or coloring page from a single uploaded image.
 
     - Use `preset` for quick configuration (overrides all other params).
-    - `mode` = "hex" (default grid) or "voronoi" (organic cells).
-    - `density` = voronoi density preset: easy/standard/detailed/expert.
+    - `mode` = "hex" | "voronoi" | "cbn" | "lineart".
     - `output` controls what you get back:
       - "zip"     → ZIP with all files (default)
-      - "mystery" → just the mystery page PNG
-      - "answer"  → just the answer key PNG
-      - "beauty"  → beauty preview PNG
-      - "legend"  → just the legend PNG
+      - "mystery" → mystery page / line art
+      - "answer"  → answer key
+      - "beauty"  → beauty preview PNG / line art preview
+      - "legend"  → legend PNG
       - "full"    → mystery + legend combined PNG
+      - "svg"     → SVG output (cbn/lineart only)
+      - "preview" → lower-res preview (lineart only)
     """
-    # Quota check
-    promo = _check_promo(promo_code)
-    remaining = _check_quota(request, promo)
-    if remaining <= 0:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "Free limit reached",
-                "message": f"You've used all {FREE_LIMIT} free generations. Upgrade to Pro for unlimited access!",
-                "upgrade_url": "https://cocotheaxolotl.org/mosaic/pricing/",
-            },
-        )
+    # Quota check — dual mode: authenticated (DB credits) or anonymous (IP quota)
+    user_id, identifier = await get_user_or_ip(request)
+
+    if user_id:
+        # Authenticated: check DB credits
+        balance = await credits_module.get_balance(user_id)
+        if balance <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "Insufficient credits",
+                    "remaining": 0,
+                    "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+                },
+            )
+    else:
+        # Anonymous: legacy IP-based quota
+        promo = _check_promo(promo_code)
+        remaining = _check_quota(request, promo)
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "Free limit reached",
+                    "message": f"You've used all {FREE_LIMIT} free generations. Upgrade to Pro for unlimited access!",
+                    "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+                },
+            )
 
     # Validate upload
     if image.content_type not in ALLOWED_TYPES:
@@ -241,23 +411,70 @@ async def generate_mosaic(
     img = _read_image(data)
     name = Path(image.filename).stem if image.filename else "mosaic"
 
-    # Generate
-    if preset and preset in PRESETS:
-        result = generate_from_preset(img, preset)
-    elif mode == "voronoi":
-        colors = max(4, min(20, colors))
-        density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
-        num_cells = density_map.get(density, density_map["standard"])
-        result = generate_voronoi(img, colors=colors, density=num_cells, page=page)
+    # AI coloring page mode — calls OpenAI, returns immediately
+    if mode == "ai":
+        ai_img = await _ai_coloring_page(data)
+        if user_id:
+            await credits_module.consume_credits(user_id, 1, "generation", {"mode": "ai"})
+        else:
+            _consume(request, 1)
+        return _img_to_streaming(ai_img, f"{name}-coloring.png")
+
+    # Generate (semaphore: only 1 at a time to prevent OOM)
+    async with _gen_semaphore:
+        if preset and preset in PRESETS:
+            result = generate_from_preset(img, preset)
+        elif mode == "lineart":
+            detail_level = detail if detail in ("simple", "standard", "detailed", "expert") else "standard"
+            thickness_clamped = max(1, min(4, thickness))
+            result = generate_line_art(img, page=page, detail_level=detail_level,
+                                       line_thickness=thickness_clamped)
+        elif mode == "cbn":
+            colors = max(4, min(20, colors))
+            result = generate_cbn(img, colors=colors, page=page, blur=2)
+        elif mode == "voronoi":
+            colors = max(4, min(20, colors))
+            density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
+            num_cells = density_map.get(density, density_map["standard"])
+            result = generate_voronoi(img, colors=colors, density=num_cells, page=page)
+        else:
+            colors = max(4, min(20, colors))
+            cell_size = max(12, min(50, cell_size))
+            result = generate(img, colors=colors, cell_size=cell_size, page=page)
+        del img
+        gc.collect()
+
+    # Consume quota — dual mode
+    if user_id:
+        await credits_module.consume_credits(
+            user_id, 1, "generation", {"mode": mode, "preset": preset}
+        )
     else:
-        colors = max(4, min(20, colors))
-        cell_size = max(12, min(50, cell_size))
-        result = generate(img, colors=colors, cell_size=cell_size, page=page)
+        _consume(request, 1)
 
-    # Consume quota
-    _consume(request, 1)
+    # Return — handle LineArtResult, CBNResult, or MosaicResult
+    if isinstance(result, LineArtResult):
+        if output in ("mystery", "png"):
+            return _img_to_streaming(result.line_art_png, f"{name}-lineart.png")
+        if output in ("svg", "answer"):
+            return _svg_to_streaming(result.line_art_svg, f"{name}-lineart.svg")
+        if output in ("beauty", "preview"):
+            return _img_to_streaming(result.preview_png, f"{name}-preview.png")
+        return _result_to_zip_stream(name, result)
 
-    # Return
+    if isinstance(result, CBNResult):
+        if output == "mystery":
+            return _svg_to_streaming(result.mystery_svg, f"{name}-mystery.svg")
+        if output == "answer":
+            return _svg_to_streaming(result.answer_svg, f"{name}-answer.svg")
+        if output == "beauty":
+            return _img_to_streaming(result.answer_png, f"{name}-answer.png")
+        if output == "legend":
+            return _img_to_streaming(result.legend_png, f"{name}-legend.png")
+        if output == "full":
+            return _img_to_streaming(result.mystery_full_png, f"{name}-mystery-full.png")
+        return _result_to_zip_stream(name, result)
+
     if output == "mystery":
         return _img_to_streaming(result.mystery, f"{name}-mystery.png")
     if output == "answer":
@@ -283,9 +500,11 @@ async def bulk_generate(
     page: str = Form("letter"),
     mode: str = Form("hex"),
     density: str = Form("standard"),
+    detail: str = Form("standard"),
+    thickness: int = Form(2),
     promo_code: Optional[str] = Form(None),
 ):
-    """Generate mosaics for multiple images at once → returns a ZIP.
+    """Generate mosaics/coloring pages for multiple images at once → returns a ZIP.
 
     - Max 50 images per request (Pro only beyond 3).
     - Each image counts as 1 quota unit.
@@ -296,49 +515,78 @@ async def bulk_generate(
     if n == 0:
         raise HTTPException(400, "No images provided")
 
-    # Quota check
-    promo = _check_promo(promo_code)
-    remaining = _check_quota(request, promo)
-    if remaining < n:
-        raise HTTPException(
-            status_code=429,
-            detail={
-                "error": "Not enough free credits",
-                "remaining": remaining,
-                "requested": n,
-                "message": f"You have {remaining} free generation(s) left but requested {n}. Upgrade to Pro!",
-                "upgrade_url": "https://cocotheaxolotl.org/mosaic/pricing/",
-            },
-        )
+    # Quota check — dual mode
+    user_id, identifier = await get_user_or_ip(request)
 
-    # Process all images
+    if user_id:
+        balance = await credits_module.get_balance(user_id)
+        if balance < n:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "Insufficient credits",
+                    "remaining": balance,
+                    "requested": n,
+                    "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+                },
+            )
+    else:
+        promo = _check_promo(promo_code)
+        remaining = _check_quota(request, promo)
+        if remaining < n:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "Not enough free credits",
+                    "remaining": remaining,
+                    "requested": n,
+                    "message": f"You have {remaining} free generation(s) left but requested {n}. Upgrade to Pro!",
+                    "upgrade_url": "https://cocotheaxolotl.org/mosaic/pricing/",
+                },
+            )
+
+    # Process all images (semaphore: only 1 generation at a time)
     results = []
-    for upload in images:
-        if upload.content_type not in ALLOWED_TYPES:
-            continue
-        data = await upload.read()
-        if len(data) > MAX_IMAGE_SIZE:
-            continue
-        img = _read_image(data)
-        name = Path(upload.filename).stem if upload.filename else f"image-{len(results)+1}"
+    async with _gen_semaphore:
+        for upload in images:
+            if upload.content_type not in ALLOWED_TYPES:
+                continue
+            data = await upload.read()
+            if len(data) > MAX_IMAGE_SIZE:
+                continue
+            img = _read_image(data)
+            name = Path(upload.filename).stem if upload.filename else f"image-{len(results)+1}"
 
-        if preset and preset in PRESETS:
-            res = generate_from_preset(img, preset)
-        elif mode == "voronoi":
-            density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
-            num_cells = density_map.get(density, density_map["standard"])
-            res = generate_voronoi(img, colors=max(4, min(20, colors)),
-                                   density=num_cells, page=page)
-        else:
-            res = generate(img, colors=max(4, min(20, colors)),
-                           cell_size=max(12, min(50, cell_size)), page=page)
-        results.append((name, res))
+            if preset and preset in PRESETS:
+                res = generate_from_preset(img, preset)
+            elif mode == "lineart":
+                detail_level = detail if detail in ("simple", "standard", "detailed", "expert") else "standard"
+                res = generate_line_art(img, page=page, detail_level=detail_level,
+                                        line_thickness=max(1, min(4, thickness)))
+            elif mode == "cbn":
+                res = generate_cbn(img, colors=max(4, min(20, colors)), page=page, blur=2)
+            elif mode == "voronoi":
+                density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
+                num_cells = density_map.get(density, density_map["standard"])
+                res = generate_voronoi(img, colors=max(4, min(20, colors)),
+                                       density=num_cells, page=page)
+            else:
+                res = generate(img, colors=max(4, min(20, colors)),
+                               cell_size=max(12, min(50, cell_size)), page=page)
+            results.append((name, res))
+            del img
+            gc.collect()
 
     if not results:
         raise HTTPException(400, "No valid images processed")
 
-    # Consume quota
-    _consume(request, len(results))
+    # Consume quota — dual mode
+    if user_id:
+        await credits_module.consume_credits(
+            user_id, len(results), "bulk_generation", {"mode": mode, "count": len(results)}
+        )
+    else:
+        _consume(request, len(results))
 
     # Pack into ZIP
     zip_data = images_to_zip(results)
@@ -352,26 +600,41 @@ async def bulk_generate(
 # ── Download store helpers ───────────────────────────────────────────────
 
 def _cleanup_downloads():
-    """Remove expired entries from the download store."""
+    """Remove expired ZIP files from disk."""
     now = time.time()
-    expired = [k for k, v in _download_store.items() if now - v["created_at"] > DOWNLOAD_TTL]
-    for k in expired:
-        del _download_store[k]
+    for meta_path in DOWNLOAD_DIR.glob("*.json"):
+        try:
+            meta = json.loads(meta_path.read_text())
+            if now - meta["created_at"] > DOWNLOAD_TTL:
+                zip_path = DOWNLOAD_DIR / meta["zip_file"]
+                zip_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+        except Exception:
+            meta_path.unlink(missing_ok=True)
 
 
 def _store_download(zip_bytes: bytes, filename: str) -> str:
-    """Store a ZIP in memory and return a unique token."""
+    """Store a ZIP on disk and return a unique token."""
     _cleanup_downloads()
-    # Evict oldest if at capacity
-    while len(_download_store) >= DOWNLOAD_MAX_ENTRIES:
-        oldest = min(_download_store, key=lambda k: _download_store[k]["created_at"])
-        del _download_store[oldest]
+    # Evict oldest if too many files
+    metas = sorted(DOWNLOAD_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    while len(metas) >= DOWNLOAD_MAX_ENTRIES:
+        old_meta = metas.pop(0)
+        try:
+            old_data = json.loads(old_meta.read_text())
+            (DOWNLOAD_DIR / old_data["zip_file"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+        old_meta.unlink(missing_ok=True)
     token = uuid.uuid4().hex
-    _download_store[token] = {
-        "zip_bytes": zip_bytes,
+    zip_path = DOWNLOAD_DIR / f"{token}.zip"
+    zip_path.write_bytes(zip_bytes)
+    meta_path = DOWNLOAD_DIR / f"{token}.json"
+    meta_path.write_text(json.dumps({
         "filename": filename,
+        "zip_file": f"{token}.zip",
         "created_at": time.time(),
-    }
+    }))
     return token
 
 
@@ -462,9 +725,11 @@ async def request_download(
     page: str = Form("letter"),
     mode: str = Form("hex"),
     density: str = Form("standard"),
+    detail: str = Form("standard"),
+    thickness: int = Form(2),
     promo_code: Optional[str] = Form(None),
 ):
-    """Generate a mosaic, store the ZIP, and email the download link."""
+    """Generate a mosaic/coloring page, store the ZIP, and email the download link."""
     # Validate email
     if not _EMAIL_RE.match(email):
         raise HTTPException(400, "Invalid email address")
@@ -479,22 +744,38 @@ async def request_download(
     img = _read_image(data)
     name = Path(image.filename).stem if image.filename else "mosaic"
 
-    # Generate
-    if preset and preset in PRESETS:
-        result = generate_from_preset(img, preset)
-    elif mode == "voronoi":
-        colors = max(4, min(20, colors))
-        density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
-        num_cells = density_map.get(density, density_map["standard"])
-        result = generate_voronoi(img, colors=colors, density=num_cells, page=page)
-    else:
-        colors = max(4, min(20, colors))
-        cell_size = max(12, min(50, cell_size))
-        result = generate(img, colors=colors, cell_size=cell_size, page=page)
+    # Generate (semaphore: only 1 generation at a time)
+    async with _gen_semaphore:
+        if preset and preset in PRESETS:
+            result = generate_from_preset(img, preset)
+        elif mode == "lineart":
+            detail_level = detail if detail in ("simple", "standard", "detailed", "expert") else "standard"
+            result = generate_line_art(img, page=page, detail_level=detail_level,
+                                       line_thickness=max(1, min(4, thickness)))
+        elif mode == "cbn":
+            colors = max(4, min(20, colors))
+            result = generate_cbn(img, colors=colors, page=page, blur=2)
+        elif mode == "voronoi":
+            colors = max(4, min(20, colors))
+            density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
+            num_cells = density_map.get(density, density_map["standard"])
+            result = generate_voronoi(img, colors=colors, density=num_cells, page=page)
+        else:
+            colors = max(4, min(20, colors))
+            cell_size = max(12, min(50, cell_size))
+            result = generate(img, colors=colors, cell_size=cell_size, page=page)
+        del img
+        gc.collect()
 
-    # Pack into ZIP
-    zip_data = images_to_zip([(name, result)])
-    filename = f"{name}-mosaic.zip"
+    # Pack into ZIP (no answer key in email download)
+    zip_data = images_to_zip([(name, result)], include_answer=False)
+    if isinstance(result, LineArtResult):
+        label = "lineart"
+    elif isinstance(result, CBNResult):
+        label = "cbn"
+    else:
+        label = "mosaic"
+    filename = f"{name}-{label}.zip"
     gc.collect()
 
     # Store and get token
@@ -506,7 +787,8 @@ async def request_download(
         _send_brevo_email(email, download_url)
     except Exception as e:
         # Remove stored ZIP if email fails
-        _download_store.pop(token, None)
+        (DOWNLOAD_DIR / f"{token}.zip").unlink(missing_ok=True)
+        (DOWNLOAD_DIR / f"{token}.json").unlink(missing_ok=True)
         raise HTTPException(500, f"Failed to send email: {e}")
 
     _add_brevo_contact(email)
@@ -518,8 +800,9 @@ async def request_download(
 def download_mosaic(token: str):
     """Serve a stored ZIP file from an email download link (one-time use)."""
     _cleanup_downloads()
-    entry = _download_store.pop(token, None)
-    if not entry:
+    meta_path = DOWNLOAD_DIR / f"{token}.json"
+    zip_path = DOWNLOAD_DIR / f"{token}.zip"
+    if not meta_path.exists() or not zip_path.exists():
         return HTMLResponse(
             content="""\
 <!DOCTYPE html>
@@ -533,11 +816,212 @@ a{display:inline-block;padding:12px 28px;background:#7c3aed;color:#fff;text-deco
 <a href="https://univers.studio/mosaic/">Generate New Mosaic</a></div></body></html>""",
             status_code=410,
         )
+    meta = json.loads(meta_path.read_text())
+    zip_bytes = zip_path.read_bytes()
+    # One-time use: delete after serving
+    zip_path.unlink(missing_ok=True)
+    meta_path.unlink(missing_ok=True)
     return StreamingResponse(
-        io.BytesIO(entry["zip_bytes"]),
+        io.BytesIO(zip_bytes),
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{entry["filename"]}"'},
+        headers={"Content-Disposition": f'attachment; filename="{meta["filename"]}"'},
     )
+
+
+# ── Auth endpoints ────────────────────────────────────────────────────────
+
+class SignupRequest(BaseModel):
+    email: str
+    password: str
+    display_name: str = ""
+    lang: str = "en"
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+class LogoutRequest(BaseModel):
+    refresh_token: str
+
+class VerifyEmailRequest(BaseModel):
+    token: str
+
+class ForgotRequest(BaseModel):
+    email: str
+    lang: str = "en"
+
+class ResetRequest(BaseModel):
+    token: str
+    password: str
+
+class ConsumeRequest(BaseModel):
+    feature: str
+    variant: str = ""
+
+
+@app.post("/api/auth/signup")
+async def api_signup(req: SignupRequest):
+    try:
+        result = await auth_module.signup(req.email, req.password, req.display_name, req.lang)
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/auth/login")
+async def api_login(req: LoginRequest):
+    try:
+        result = await auth_module.login(req.email, req.password)
+        return result
+    except ValueError as e:
+        raise HTTPException(401, str(e))
+
+
+@app.post("/api/auth/refresh")
+async def api_refresh(req: RefreshRequest):
+    try:
+        result = await auth_module.refresh(req.refresh_token)
+        return result
+    except ValueError as e:
+        raise HTTPException(401, str(e))
+
+
+@app.post("/api/auth/logout")
+async def api_logout(req: LogoutRequest):
+    await auth_module.logout(req.refresh_token)
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+async def api_me(request: Request):
+    user_id, identifier = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    profile = await auth_module.get_me(user_id)
+    if not profile:
+        raise HTTPException(404, "User not found")
+    return profile
+
+
+@app.post("/api/auth/verify-email")
+async def api_verify_email(req: VerifyEmailRequest):
+    ok = await auth_module.verify_email_token(req.token)
+    if not ok:
+        raise HTTPException(400, "Invalid or expired verification token")
+    return {"ok": True}
+
+
+@app.post("/api/auth/forgot")
+async def api_forgot(req: ForgotRequest):
+    await auth_module.send_password_reset(req.email, req.lang)
+    return {"ok": True, "message": "If an account exists, a reset email has been sent."}
+
+
+@app.post("/api/auth/reset")
+async def api_reset(req: ResetRequest):
+    ok = await auth_module.reset_password(req.token, req.password)
+    if not ok:
+        raise HTTPException(400, "Invalid or expired reset token, or password too short")
+    return {"ok": True}
+
+
+# ── Credits endpoints ─────────────────────────────────────────────────────
+
+@app.get("/api/credits/balance")
+async def api_credits_balance(request: Request):
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    info = await credits_module.get_plan_info(user_id)
+    if not info:
+        raise HTTPException(404, "No credit info found")
+    return info
+
+
+@app.get("/api/credits/history")
+async def api_credits_history(request: Request):
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    history = await credits_module.get_transaction_history(user_id)
+    return {"transactions": history}
+
+
+@app.post("/api/credits/consume")
+async def api_credits_consume(request: Request, req: ConsumeRequest):
+    """Consume 1 credit for a feature (name generators, etc.)."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    success, remaining = await credits_module.consume_credits(
+        user_id, 1, "generation",
+        metadata={"feature": req.feature, "variant": req.variant},
+    )
+    if not success:
+        raise HTTPException(402, {
+            "error": "Insufficient credits",
+            "remaining": remaining,
+            "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+        })
+    return {"ok": True, "remaining": remaining}
+
+
+# ── Billing endpoints ─────────────────────────────────────────────────────
+
+class CheckoutRequest(BaseModel):
+    plan: str  # "basic" | "personal" | "commercial"
+
+
+@app.get("/api/billing/plans")
+def api_billing_plans():
+    """Public: list all available plans."""
+    return {"plans": stripe_integration.get_plans_public()}
+
+
+@app.post("/api/billing/checkout")
+async def api_billing_checkout(request: Request, req: CheckoutRequest):
+    """Create a Stripe Checkout session. Requires auth."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    profile = await auth_module.get_me(user_id)
+    if not profile:
+        raise HTTPException(404, "User not found")
+    try:
+        url = await stripe_integration.create_checkout_session(
+            user_id, profile["email"], req.plan
+        )
+        return {"url": url}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/billing/portal")
+async def api_billing_portal(request: Request):
+    """Create a Stripe Customer Portal session. Requires auth."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        url = await stripe_integration.create_portal_session(user_id)
+        return {"url": url}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/api/billing/webhook")
+async def api_billing_webhook(request: Request):
+    """Stripe webhook handler. Verifies signature, processes events."""
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature", "")
+    try:
+        result = await stripe_integration.handle_webhook(payload, sig)
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 # ── Health ───────────────────────────────────────────────────────────────
@@ -550,4 +1034,4 @@ def stats():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "1.0.0"}
+    return {"status": "ok", "version": "2.0.0"}
