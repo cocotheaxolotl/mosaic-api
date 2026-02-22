@@ -1,0 +1,87 @@
+"""
+Database module — SQLite via aiosqlite.
+Stores users, credits, transactions, and refresh tokens.
+"""
+
+import os
+import aiosqlite
+
+DB_PATH = os.environ.get("DB_PATH", "/data/mosaic.db")
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    email           TEXT UNIQUE NOT NULL COLLATE NOCASE,
+    password_hash   TEXT NOT NULL,
+    display_name    TEXT DEFAULT '',
+    created_at      REAL NOT NULL DEFAULT (unixepoch()),
+    email_verified  INTEGER DEFAULT 0,
+    stripe_customer_id TEXT UNIQUE,
+    lang            TEXT DEFAULT 'en'
+);
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+CREATE INDEX IF NOT EXISTS idx_users_stripe ON users(stripe_customer_id);
+
+CREATE TABLE IF NOT EXISTS credits (
+    user_id          INTEGER PRIMARY KEY REFERENCES users(id),
+    balance          INTEGER NOT NULL DEFAULT 3,
+    monthly_quota    INTEGER NOT NULL DEFAULT 3,
+    plan_name        TEXT NOT NULL DEFAULT 'free',
+    stripe_sub_id    TEXT,
+    sub_status       TEXT DEFAULT 'none',
+    current_period_end REAL,
+    updated_at       REAL NOT NULL DEFAULT (unixepoch())
+);
+
+CREATE TABLE IF NOT EXISTS credit_transactions (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    delta      INTEGER NOT NULL,
+    reason     TEXT NOT NULL,
+    metadata   TEXT,
+    created_at REAL NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_txn_user ON credit_transactions(user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    token_hash TEXT UNIQUE NOT NULL,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id         TEXT PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users(id),
+    key_hash   TEXT UNIQUE NOT NULL,
+    key_prefix TEXT NOT NULL,
+    name       TEXT DEFAULT '',
+    created_at REAL NOT NULL DEFAULT (unixepoch()),
+    last_used_at REAL,
+    is_active  INTEGER DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_apikeys_user ON api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_apikeys_hash ON api_keys(key_hash);
+"""
+
+
+async def get_db() -> aiosqlite.Connection:
+    """Open a connection with WAL mode and foreign keys enabled."""
+    db = await aiosqlite.connect(DB_PATH)
+    db.row_factory = aiosqlite.Row
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA foreign_keys=ON")
+    return db
+
+
+async def init_db():
+    """Create all tables if they don't exist. Called once at app startup."""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    db = await get_db()
+    try:
+        await db.executescript(SCHEMA_SQL)
+        await db.commit()
+    finally:
+        await db.close()

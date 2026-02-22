@@ -21,6 +21,9 @@ Endpoints:
     POST /api/credits/consume   — consume 1 credit (for name generators)
     GET  /api/credits/balance   — current credit balance
     GET  /api/credits/history   — transaction history
+    POST /api/keys              — create API key (commercial plan)
+    GET  /api/keys              — list API keys
+    DELETE /api/keys/{id}       — revoke API key
 """
 
 import io
@@ -32,6 +35,7 @@ import time
 import uuid
 import hashlib
 import asyncio
+import zipfile
 import urllib.request
 from pathlib import Path
 from typing import List, Optional
@@ -40,17 +44,18 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Bod
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from database import init_db
 import auth as auth_module
 import credits as credits_module
 import stripe_integration
+import api_keys as api_keys_module
 
 from mosaic_engine import (
-    generate, generate_voronoi, generate_cbn, generate_line_art,
+    generate, generate_voronoi, generate_cbn, generate_line_art, generate_pbn,
     generate_from_preset, images_to_zip,
-    PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, LineArtResult,
+    PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, PBNResult, LineArtResult,
 )
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -92,7 +97,7 @@ app.add_middleware(
         "http://127.0.0.1:8000",
         "http://localhost:3000",
     ],
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -107,12 +112,22 @@ async def startup():
 
 async def get_user_or_ip(request: Request) -> tuple[int | None, str]:
     """
-    Identify the caller. If Bearer token present and valid, returns (user_id, "user:<id>").
-    Otherwise falls back to IP-based identification: (None, "ip:<hash>").
+    Identify the caller. Supports two auth modes:
+    1. API key: Authorization: Bearer us_live_XXXX → lookup in api_keys table
+    2. JWT:     Authorization: Bearer <jwt>        → decode JWT
+    Falls back to IP-based identification: (None, "ip:<hash>").
     """
     auth_header = request.headers.get("Authorization", "")
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
+        # API key auth: detect by prefix
+        if token.startswith(api_keys_module.API_KEY_PREFIX):
+            user_id = await api_keys_module.verify_api_key(token)
+            if user_id:
+                return (user_id, f"user:{user_id}")
+            # Invalid API key → don't fall through to IP, return 401
+            return (None, f"ip:{_user_key(request)}")
+        # JWT auth
         payload = auth_module.decode_access_token(token)
         if payload:
             user_id = payload["sub"]
@@ -214,6 +229,8 @@ def _result_to_zip_stream(name: str, res) -> StreamingResponse:
         label = "lineart"
     elif isinstance(res, CBNResult):
         label = "cbn"
+    elif isinstance(res, PBNResult):
+        label = "pbn"
     else:
         label = "mosaic"
     return StreamingResponse(
@@ -231,6 +248,71 @@ def _svg_to_streaming(svg_str: str, filename: str) -> StreamingResponse:
     )
 
 
+# ── Watermark ────────────────────────────────────────────────────────────
+
+import math
+
+def _add_watermark(img: Image.Image) -> Image.Image:
+    """Add tiled diagonal 'univers.studio' watermark to a preview image.
+
+    Returns a new RGBA→RGB image with semi-transparent text repeated across
+    the entire surface.  The original image is NOT modified.
+    """
+    # Work on a copy in RGBA so we can composite transparency
+    base = img.convert("RGBA")
+    w, h = base.size
+
+    # Create a transparent overlay for the watermark text
+    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    # Choose font size relative to image (roughly 3% of diagonal)
+    diag = math.hypot(w, h)
+    font_size = max(16, int(diag * 0.03))
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+    except (IOError, OSError):
+        font = ImageFont.load_default()
+
+    text = "univers.studio"
+    # Measure text size
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    # Spacing between watermark tiles
+    spacing_x = tw + int(tw * 0.8)
+    spacing_y = th + int(th * 3)
+
+    # Draw rotated text tiles across the image
+    # We create a larger temporary image, draw text, rotate, then paste
+    tile_img = Image.new("RGBA", (w * 2, h * 2), (0, 0, 0, 0))
+    tile_draw = ImageDraw.Draw(tile_img)
+
+    # Fill with repeated text (semi-transparent gray)
+    alpha = 45  # subtle but visible
+    color = (128, 128, 128, alpha)
+    y = -h // 2
+    while y < h * 2:
+        x = -w // 2
+        while x < w * 2:
+            tile_draw.text((x, y), text, fill=color, font=font)
+            x += spacing_x
+        y += spacing_y
+
+    # Rotate -30 degrees
+    rotated = tile_img.rotate(30, resample=Image.BICUBIC, expand=False)
+
+    # Crop center to match original size
+    rx, ry = rotated.size
+    left = (rx - w) // 2
+    top = (ry - h) // 2
+    cropped = rotated.crop((left, top, left + w, top + h))
+
+    # Composite
+    watermarked = Image.alpha_composite(base, cropped)
+    return watermarked.convert("RGB")
+
+
 # ── AI Coloring Page (OpenAI) ────────────────────────────────────────────
 
 import base64
@@ -239,68 +321,129 @@ import httpx
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 
-async def _ai_coloring_page(image_data: bytes) -> Image.Image:
-    """Generate a coloring page using OpenAI: Vision describes the image, then GPT Image generates line art."""
+async def _ai_coloring_page(image_data: bytes, hint: str = "") -> Image.Image:
+    """Generate a coloring page using OpenAI gpt-image-1 edits endpoint.
+
+    Sends the actual photo directly to the model so it can see the exact pose,
+    framing, and composition — much better than describe-then-generate.
+    """
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OpenAI API key not configured")
 
-    # Step 1: Describe the image with GPT-4o-mini vision
-    b64_img = base64.b64encode(image_data).decode("utf-8")
+    # Resize image to max 1024px to stay within API limits
+    img_input = Image.open(io.BytesIO(image_data)).convert("RGBA")
+    img_input.thumbnail((1024, 1024), Image.LANCZOS)
+    png_buf = io.BytesIO()
+    img_input.save(png_buf, format="PNG")
+    png_bytes = png_buf.getvalue()
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        vision_resp = await client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": "gpt-4o-mini",
-                "max_tokens": 200,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "Describe this image in one short sentence for generating a coloring page. Focus on the main subject, its pose, and any accessories. Be concise. Example: 'a cute baby leopard wearing a beanie hat, sitting and looking forward'",
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{b64_img}", "detail": "low"},
-                            },
-                        ],
-                    }
-                ],
-            },
-        )
-        if vision_resp.status_code != 200:
-            raise HTTPException(502, f"Vision API error: {vision_resp.text[:200]}")
-        description = vision_resp.json()["choices"][0]["message"]["content"].strip()
+    hint_text = ""
+    if hint:
+        hint_text = f" The subject is: {hint}."
 
-    # Step 2: Generate coloring page with GPT Image 1 Mini
     prompt = (
-        f"Simple black and white coloring page for children. "
+        f"Transform this photo into a simple black and white coloring page for children.{hint_text} "
+        f"Keep the EXACT same pose, framing, and composition as the original photo. "
         f"Bold clean outlines, no shading, no gray tones, no colors, pure white background. "
-        f"Subject: {description}. "
         f"Style: cute cartoon illustration with clear thick outlines, suitable for kids to color with crayons."
     )
 
-    async with httpx.AsyncClient(timeout=90) as client:
+    async with httpx.AsyncClient(timeout=120) as client:
         img_resp = await client.post(
-            "https://api.openai.com/v1/images/generations",
+            "https://api.openai.com/v1/images/edits",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
+            files={"image": ("photo.png", png_bytes, "image/png")},
+            data={
                 "model": "gpt-image-1",
                 "prompt": prompt,
-                "n": 1,
+                "n": "1",
                 "size": "1024x1024",
                 "quality": "low",
             },
         )
         if img_resp.status_code != 200:
-            raise HTTPException(502, f"Image API error: {img_resp.text[:200]}")
+            raise HTTPException(502, f"Image API error: {img_resp.text[:300]}")
 
         img_b64 = img_resp.json()["data"][0]["b64_json"]
         img_bytes = base64.b64decode(img_b64)
         return Image.open(io.BytesIO(img_bytes)).convert("RGB")
+
+
+_AI_STYLE_PREFIXES = {
+    "coloring": (
+        "Simple black and white coloring page for children. "
+        "Bold clean outlines, no shading, no gray tones, no colors, pure white background. "
+        "Subject: {prompt}. "
+        "Style: cute cartoon illustration with clear thick outlines, suitable for kids to color with crayons."
+    ),
+    "cartoon": (
+        "Colorful cartoon illustration, cute style, clean lines, vibrant colors. "
+        "Subject: {prompt}. "
+        "Style: fun, child-friendly, bright palette, professional cartoon art."
+    ),
+    "realistic": (
+        "Realistic high-quality photograph with natural lighting. "
+        "Subject: {prompt}. "
+        "Style: detailed, photorealistic, sharp focus, professional photography."
+    ),
+    "pixel-art": (
+        "Pixel art illustration in retro 16-bit video game style. "
+        "Subject: {prompt}. "
+        "Style: clean crisp pixels, vibrant limited palette, nostalgic game-like aesthetic."
+    ),
+    "watercolor": (
+        "Beautiful watercolor painting with soft washes and artistic brush strokes. "
+        "Subject: {prompt}. "
+        "Style: delicate, flowing translucent colors, hand-painted feel, fine art quality."
+    ),
+    "sticker": (
+        "Die-cut sticker design with white border, cartoon style, no background. "
+        "Subject: {prompt}. "
+        "Style: cute kawaii, bold outlines, flat colors, compact centered composition."
+    ),
+}
+
+
+_AI_QUALITY_CREDITS = {"low": 1, "medium": 3, "high": 10}
+
+
+async def _ai_text_to_image(
+    prompt: str,
+    style: str = "coloring",
+    size: str = "1024x1024",
+    quality: str = "low",
+) -> Image.Image:
+    """Generate an image from a text prompt using OpenAI gpt-image-1."""
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, "OpenAI API key not configured")
+
+    template = _AI_STYLE_PREFIXES.get(style, "{prompt}")
+    full_prompt = template.replace("{prompt}", prompt)
+
+    valid_sizes = ("1024x1024", "1024x1536", "1536x1024", "auto")
+    if size not in valid_sizes:
+        size = "1024x1024"
+
+    if quality not in ("low", "medium", "high"):
+        quality = "low"
+
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(
+            "https://api.openai.com/v1/images/generations",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": "gpt-image-1",
+                "prompt": full_prompt,
+                "n": 1,
+                "size": size,
+                "quality": quality,
+            },
+        )
+        if resp.status_code != 200:
+            raise HTTPException(502, f"Image API error: {resp.text[:200]}")
+
+        img_b64 = resp.json()["data"][0]["b64_json"]
+        return Image.open(io.BytesIO(base64.b64decode(img_b64))).convert("RGB")
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────
@@ -342,6 +485,88 @@ async def check_quota(request: Request):
     return {"remaining": remaining, "limit": FREE_LIMIT, "authenticated": False}
 
 
+@app.post("/api/ai-image")
+async def ai_image_generate(
+    request: Request,
+    prompt: str = Form(...),
+    style: str = Form("coloring"),
+    size: str = Form("1024x1024"),
+    quality: str = Form("low"),
+    promo_code: Optional[str] = Form(None),
+):
+    """Generate an image from a text prompt using AI (gpt-image-1).
+
+    Styles: coloring, cartoon, realistic, pixel-art, watercolor, sticker.
+    Sizes: 1024x1024, 1024x1536, 1536x1024.
+    Quality: low (1 credit), medium (3 credits), high (10 credits).
+    """
+    # Quota check
+    user_id, identifier = await get_user_or_ip(request)
+
+    if user_id:
+        balance = await credits_module.get_balance(user_id)
+        if balance <= 0:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "error": "Insufficient credits",
+                    "remaining": 0,
+                    "message": f"You've used all your credits. Upgrade for more!",
+                    "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+                },
+            )
+    else:
+        if promo_code:
+            _apply_promo(request, promo_code)
+        remaining = _check_quota(request)
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail={
+                    "error": "Free quota exceeded",
+                    "remaining": 0,
+                    "message": f"You've used all {FREE_LIMIT} free generations. Upgrade to Pro for unlimited access!",
+                    "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+                },
+            )
+
+    # Validate prompt
+    prompt = prompt.strip()
+    if len(prompt) < 3:
+        raise HTTPException(400, "Prompt must be at least 3 characters")
+    if len(prompt) > 1000:
+        raise HTTPException(400, "Prompt must be under 1000 characters")
+
+    # Validate quality & determine credit cost
+    if quality not in _AI_QUALITY_CREDITS:
+        quality = "low"
+    cost = _AI_QUALITY_CREDITS[quality]
+
+    # Check sufficient credits for authenticated users
+    if user_id and balance < cost:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "Insufficient credits",
+                "remaining": balance,
+                "cost": cost,
+                "message": f"This quality requires {cost} credits but you have {balance}. Choose a lower quality or upgrade!",
+                "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+            },
+        )
+
+    # Generate
+    ai_img = await _ai_text_to_image(prompt, style=style, size=size, quality=quality)
+
+    # Consume credits
+    if user_id:
+        await credits_module.consume_credits(user_id, cost, "generation", {"mode": "ai-image", "style": style, "quality": quality})
+    else:
+        _consume(request, cost)
+
+    return _img_to_streaming(_add_watermark(ai_img), "ai-image.png")
+
+
 @app.post("/api/generate")
 async def generate_mosaic(
     request: Request,
@@ -355,6 +580,7 @@ async def generate_mosaic(
     density: str = Form("standard"),  # voronoi density: easy/standard/detailed/expert
     detail: str = Form("standard"),   # lineart detail: simple/standard/detailed/expert
     thickness: int = Form(2),         # lineart line thickness: 1-4
+    hint: str = Form(""),             # optional user hint for AI mode (e.g. "an impala")
     promo_code: Optional[str] = Form(None),
 ):
     """Generate a mystery mosaic or coloring page from a single uploaded image.
@@ -413,12 +639,12 @@ async def generate_mosaic(
 
     # AI coloring page mode — calls OpenAI, returns immediately
     if mode == "ai":
-        ai_img = await _ai_coloring_page(data)
+        ai_img = await _ai_coloring_page(data, hint=hint.strip())
         if user_id:
             await credits_module.consume_credits(user_id, 1, "generation", {"mode": "ai"})
         else:
             _consume(request, 1)
-        return _img_to_streaming(ai_img, f"{name}-coloring.png")
+        return _img_to_streaming(_add_watermark(ai_img), f"{name}-coloring.png")
 
     # Generate (semaphore: only 1 at a time to prevent OOM)
     async with _gen_semaphore:
@@ -432,6 +658,9 @@ async def generate_mosaic(
         elif mode == "cbn":
             colors = max(4, min(20, colors))
             result = generate_cbn(img, colors=colors, page=page, blur=2)
+        elif mode == "pbn":
+            colors = max(4, min(30, colors))
+            result = generate_pbn(img, colors=colors, page=page, blur=2)
         elif mode == "voronoi":
             colors = max(4, min(20, colors))
             density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
@@ -453,38 +682,39 @@ async def generate_mosaic(
         _consume(request, 1)
 
     # Return — handle LineArtResult, CBNResult, or MosaicResult
+    # All preview/beauty outputs get watermarked; downloads via email don't.
     if isinstance(result, LineArtResult):
         if output in ("mystery", "png"):
-            return _img_to_streaming(result.line_art_png, f"{name}-lineart.png")
+            return _img_to_streaming(_add_watermark(result.line_art_png), f"{name}-lineart.png")
         if output in ("svg", "answer"):
             return _svg_to_streaming(result.line_art_svg, f"{name}-lineart.svg")
         if output in ("beauty", "preview"):
-            return _img_to_streaming(result.preview_png, f"{name}-preview.png")
+            return _img_to_streaming(_add_watermark(result.preview_png), f"{name}-preview.png")
         return _result_to_zip_stream(name, result)
 
-    if isinstance(result, CBNResult):
+    if isinstance(result, (CBNResult, PBNResult)):
         if output == "mystery":
             return _svg_to_streaming(result.mystery_svg, f"{name}-mystery.svg")
         if output == "answer":
             return _svg_to_streaming(result.answer_svg, f"{name}-answer.svg")
         if output == "beauty":
-            return _img_to_streaming(result.answer_png, f"{name}-answer.png")
+            return _img_to_streaming(_add_watermark(result.answer_png), f"{name}-answer.png")
         if output == "legend":
-            return _img_to_streaming(result.legend_png, f"{name}-legend.png")
+            return _img_to_streaming(_add_watermark(result.legend_png), f"{name}-legend.png")
         if output == "full":
-            return _img_to_streaming(result.mystery_full_png, f"{name}-mystery-full.png")
+            return _img_to_streaming(_add_watermark(result.mystery_full_png), f"{name}-mystery-full.png")
         return _result_to_zip_stream(name, result)
 
     if output == "mystery":
-        return _img_to_streaming(result.mystery, f"{name}-mystery.png")
+        return _img_to_streaming(_add_watermark(result.mystery), f"{name}-mystery.png")
     if output == "answer":
-        return _img_to_streaming(result.answer, f"{name}-answer.png")
+        return _img_to_streaming(_add_watermark(result.answer), f"{name}-answer.png")
     if output == "beauty":
-        return _img_to_streaming(result.beauty, f"{name}-beauty.png")
+        return _img_to_streaming(_add_watermark(result.beauty), f"{name}-beauty.png")
     if output == "legend":
-        return _img_to_streaming(result.legend, f"{name}-legend.png")
+        return _img_to_streaming(_add_watermark(result.legend), f"{name}-legend.png")
     if output == "full":
-        return _img_to_streaming(result.mystery_full, f"{name}-mystery-full.png")
+        return _img_to_streaming(_add_watermark(result.mystery_full), f"{name}-mystery-full.png")
 
     # Default: ZIP
     return _result_to_zip_stream(name, result)
@@ -565,6 +795,8 @@ async def bulk_generate(
                                         line_thickness=max(1, min(4, thickness)))
             elif mode == "cbn":
                 res = generate_cbn(img, colors=max(4, min(20, colors)), page=page, blur=2)
+            elif mode == "pbn":
+                res = generate_pbn(img, colors=max(4, min(30, colors)), page=page, blur=2)
             elif mode == "voronoi":
                 density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
                 num_cells = density_map.get(density, density_map["standard"])
@@ -638,27 +870,36 @@ def _store_download(zip_bytes: bytes, filename: str) -> str:
     return token
 
 
-def _send_brevo_email(to_email: str, download_url: str):
+def _send_brevo_email(to_email: str, download_url: str, mode: str = "hex"):
     """Send a transactional email via Brevo API with the download link."""
     if not BREVO_API_KEY:
         raise RuntimeError("BREVO_API_KEY not configured")
 
+    # Adapt email content to the generation mode
+    _MODE_LABELS = {
+        "ai": ("Your AI Coloring Page is ready!", "coloring page", "Download My Coloring Page"),
+        "lineart": ("Your Coloring Page is ready!", "coloring page", "Download My Coloring Page"),
+        "cbn": ("Your Color by Number is ready!", "color by number", "Download My Color by Number"),
+        "pbn": ("Your Paint by Number is ready!", "paint by number", "Download My Paint by Number"),
+    }
+    subject, label, btn_text = _MODE_LABELS.get(mode, ("Your Mystery Mosaic is ready!", "mosaic", "Download My Mosaic"))
+
     html = f"""\
 <div style="font-family:Inter,Helvetica,Arial,sans-serif;max-width:520px;margin:0 auto;padding:32px 20px">
-  <h1 style="color:#1a1a2e;font-size:1.5em;margin:0 0 8px">Your Mystery Mosaic is ready!</h1>
+  <h1 style="color:#1a1a2e;font-size:1.5em;margin:0 0 8px">{subject}</h1>
   <p style="color:#6b7280;line-height:1.6;margin:0 0 24px">
-    Your mosaic has been generated. Click the button below to download your full pack (ZIP)
-    — includes the mystery page, answer key, beauty preview, and color legend at 300&nbsp;DPI.
+    Your {label} has been generated. Click the button below to download your file (ZIP)
+    at 300&nbsp;DPI print quality.
   </p>
   <a href="{download_url}"
      style="display:inline-block;padding:14px 36px;background:#7c3aed;color:#fff;
             text-decoration:none;border-radius:10px;font-weight:700;font-size:1.05em">
-    Download My Mosaic
+    {btn_text}
   </a>
   <p style="color:#9ca3af;font-size:.85em;margin:24px 0 0;line-height:1.5">
     This link expires in 1 hour and can only be used once.<br>
-    If the link has expired, simply generate a new mosaic on
-    <a href="https://univers.studio/mosaic/" style="color:#7c3aed">univers.studio</a>.
+    If the link has expired, simply generate a new one on
+    <a href="https://univers.studio" style="color:#7c3aed">univers.studio</a>.
   </p>
   <hr style="border:none;border-top:1px solid #e5e7eb;margin:28px 0 16px">
   <p style="color:#9ca3af;font-size:.78em;margin:0">
@@ -670,7 +911,7 @@ def _send_brevo_email(to_email: str, download_url: str):
     payload = json.dumps({
         "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
         "to": [{"email": to_email}],
-        "subject": "Your Mystery Mosaic is ready!",
+        "subject": subject,
         "htmlContent": html,
     }).encode()
 
@@ -727,6 +968,7 @@ async def request_download(
     density: str = Form("standard"),
     detail: str = Form("standard"),
     thickness: int = Form(2),
+    hint: str = Form(""),
     promo_code: Optional[str] = Form(None),
 ):
     """Generate a mosaic/coloring page, store the ZIP, and email the download link."""
@@ -744,6 +986,34 @@ async def request_download(
     img = _read_image(data)
     name = Path(image.filename).stem if image.filename else "mosaic"
 
+    # AI coloring page mode — calls OpenAI, bypasses semaphore
+    if mode == "ai":
+        ai_img = await _ai_coloring_page(data, hint=hint.strip())
+        # Pack AI image into a simple ZIP
+        buf = io.BytesIO()
+        ai_img.save(buf, format="PNG")
+        ai_png = buf.getvalue()
+        del ai_img, buf
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"{name}/{name}-coloring.png", ai_png)
+        zip_data = zip_buf.getvalue()
+        del ai_png, zip_buf
+        filename = f"{name}-coloring.zip"
+        gc.collect()
+
+        token = _store_download(zip_data, filename)
+        download_url = f"{API_PUBLIC_URL}/api/download/{token}"
+        try:
+            _send_brevo_email(email, download_url, mode="ai")
+        except Exception as e:
+            (DOWNLOAD_DIR / f"{token}.zip").unlink(missing_ok=True)
+            (DOWNLOAD_DIR / f"{token}.json").unlink(missing_ok=True)
+            raise HTTPException(500, f"Failed to send email: {e}")
+        _add_brevo_contact(email)
+        return {"ok": True, "message": "Download link sent to your email!"}
+
     # Generate (semaphore: only 1 generation at a time)
     async with _gen_semaphore:
         if preset and preset in PRESETS:
@@ -755,6 +1025,9 @@ async def request_download(
         elif mode == "cbn":
             colors = max(4, min(20, colors))
             result = generate_cbn(img, colors=colors, page=page, blur=2)
+        elif mode == "pbn":
+            colors = max(4, min(30, colors))
+            result = generate_pbn(img, colors=colors, page=page, blur=2)
         elif mode == "voronoi":
             colors = max(4, min(20, colors))
             density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
@@ -773,6 +1046,8 @@ async def request_download(
         label = "lineart"
     elif isinstance(result, CBNResult):
         label = "cbn"
+    elif isinstance(result, PBNResult):
+        label = "pbn"
     else:
         label = "mosaic"
     filename = f"{name}-{label}.zip"
@@ -784,7 +1059,7 @@ async def request_download(
 
     # Send email + add to contacts
     try:
-        _send_brevo_email(email, download_url)
+        _send_brevo_email(email, download_url, mode=mode)
     except Exception as e:
         # Remove stored ZIP if email fails
         (DOWNLOAD_DIR / f"{token}.zip").unlink(missing_ok=True)
@@ -1022,6 +1297,107 @@ async def api_billing_webhook(request: Request):
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+# ── API Keys endpoints ────────────────────────────────────────────────────
+
+class CreateKeyRequest(BaseModel):
+    name: str = ""
+
+@app.post("/api/keys")
+async def api_create_key(request: Request, req: CreateKeyRequest):
+    """Create a new API key. Requires auth + commercial plan."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    info = await credits_module.get_plan_info(user_id)
+    if not info or info["plan_name"] != "commercial":
+        raise HTTPException(403, "API keys are only available on the Commercial plan")
+    key_id, raw_key = await api_keys_module.create_api_key(user_id, req.name)
+    return {"id": key_id, "key": raw_key, "name": req.name.strip()[:100]}
+
+
+@app.get("/api/keys")
+async def api_list_keys(request: Request):
+    """List all API keys for the current user. Requires auth."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    keys = await api_keys_module.list_api_keys(user_id)
+    return {"keys": keys}
+
+
+@app.delete("/api/keys/{key_id}")
+async def api_revoke_key(request: Request, key_id: str):
+    """Revoke an API key. Requires auth."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    ok = await api_keys_module.revoke_api_key(key_id, user_id)
+    if not ok:
+        raise HTTPException(404, "Key not found")
+    return {"ok": True}
+
+
+# ── Preview store (flipbook) ──────────────────────────────────────────────
+
+PREVIEW_DIR = Path("/data/previews")
+PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+PREVIEW_TTL = 3600  # 1 hour
+
+
+def _cleanup_previews():
+    """Remove preview HTML files older than PREVIEW_TTL."""
+    now = time.time()
+    for f in PREVIEW_DIR.glob("*.html"):
+        try:
+            if now - f.stat().st_mtime > PREVIEW_TTL:
+                f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@app.post("/api/preview")
+async def create_preview(request: Request):
+    """Store a self-contained HTML flipbook and return a temporary URL (1h)."""
+    _cleanup_previews()
+    body = await request.body()
+    if len(body) > 100_000_000:
+        raise HTTPException(413, "Preview too large (max 100 MB)")
+    if len(body) < 100:
+        raise HTTPException(400, "Empty or invalid HTML")
+    token = uuid.uuid4().hex[:12]
+    (PREVIEW_DIR / f"{token}.html").write_bytes(body)
+    url = f"{API_PUBLIC_URL}/preview/{token}"
+    return {"token": token, "url": url}
+
+
+@app.get("/preview/{token}")
+def serve_preview(token: str):
+    """Serve a stored preview HTML. Returns 410 if expired or not found."""
+    _cleanup_previews()
+    if not re.match(r'^[a-f0-9]{12}$', token):
+        raise HTTPException(400, "Invalid token")
+    path = PREVIEW_DIR / f"{token}.html"
+    if not path.exists():
+        return HTMLResponse(
+            content="""\
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lien expir&eacute;</title>
+<style>body{font-family:Inter,Helvetica,sans-serif;display:flex;align-items:center;justify-content:center;
+min-height:100vh;margin:0;background:#1a1a2e;color:#fff;text-align:center;padding:20px}
+.box{max-width:400px}.emoji{font-size:3em;margin:0 0 16px}h1{font-size:1.3em;margin:0 0 8px}
+p{opacity:.7;line-height:1.6;margin:0 0 20px;font-size:.95em}</style></head>
+<body><div class="box"><div class="emoji">&#9200;</div>
+<h1>Ce lien a expir&eacute;</h1>
+<p>Les liens de preview sont valides pendant 1&nbsp;heure.
+G&eacute;n&eacute;rez un nouveau flipbook pour obtenir un nouveau lien.</p>
+</div></body></html>""",
+            status_code=410,
+        )
+    html = path.read_text(encoding="utf-8")
+    return HTMLResponse(content=html)
 
 
 # ── Health ───────────────────────────────────────────────────────────────
