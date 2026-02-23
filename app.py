@@ -1107,6 +1107,7 @@ class SignupRequest(BaseModel):
     password: str
     display_name: str = ""
     lang: str = "en"
+    ref: str = ""
 
 class LoginRequest(BaseModel):
     email: str
@@ -1137,7 +1138,7 @@ class ConsumeRequest(BaseModel):
 @app.post("/api/auth/signup")
 async def api_signup(req: SignupRequest):
     try:
-        result = await auth_module.signup(req.email, req.password, req.display_name, req.lang)
+        result = await auth_module.signup(req.email, req.password, req.display_name, req.lang, req.ref)
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -1244,7 +1245,9 @@ async def api_credits_consume(request: Request, req: ConsumeRequest):
 # ── Billing endpoints ─────────────────────────────────────────────────────
 
 class CheckoutRequest(BaseModel):
-    plan: str  # "basic" | "personal" | "commercial"
+    plan: str  # "creator" | "pro" | "studio" | "pack_20" | "pack_100"
+    billing: str = "monthly"  # "monthly" | "annual" (ignored for packs)
+    ref: str = ""
 
 
 @app.get("/api/billing/plans")
@@ -1264,7 +1267,7 @@ async def api_billing_checkout(request: Request, req: CheckoutRequest):
         raise HTTPException(404, "User not found")
     try:
         url = await stripe_integration.create_checkout_session(
-            user_id, profile["email"], req.plan
+            user_id, profile["email"], req.plan, req.billing, req.ref
         )
         return {"url": url}
     except ValueError as e:
@@ -1308,8 +1311,8 @@ async def api_create_key(request: Request, req: CreateKeyRequest):
     if not user_id:
         raise HTTPException(401, "Not authenticated")
     info = await credits_module.get_plan_info(user_id)
-    if not info or info["plan_name"] != "commercial":
-        raise HTTPException(403, "API keys are only available on the Commercial plan")
+    if not info or info["plan_name"] != "studio":
+        raise HTTPException(403, "API keys are only available on the Studio plan")
     key_id, raw_key = await api_keys_module.create_api_key(user_id, req.name)
     return {"id": key_id, "key": raw_key, "name": req.name.strip()[:100]}
 

@@ -1,7 +1,11 @@
 app = 'mosaic-api'
-primary_region = 'iad'
+primary_region = 'cdg'
 
 [build]
+
+[mounts]
+  source = "mosaic_data"
+  destination = "/data"
 
 [http_service]
   internal_port = 8000
@@ -12,6 +16,6 @@ primary_region = 'iad'
   processes = ['app']
 
 [[vm]]
-  cpu_kind = 'shared'
+  cpu_kind = 'performance'
   cpus = 1
-  memory_mb = 512
+  memory_mb = 2048

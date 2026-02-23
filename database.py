@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
     created_at      REAL NOT NULL DEFAULT (unixepoch()),
     email_verified  INTEGER DEFAULT 0,
     stripe_customer_id TEXT UNIQUE,
-    lang            TEXT DEFAULT 'en'
+    lang            TEXT DEFAULT 'en',
+    affiliate_ref   TEXT DEFAULT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_users_stripe ON users(stripe_customer_id);
@@ -82,6 +83,11 @@ async def init_db():
     db = await get_db()
     try:
         await db.executescript(SCHEMA_SQL)
+        # Migration: add affiliate_ref column if missing (existing databases)
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN affiliate_ref TEXT DEFAULT NULL")
+        except Exception:
+            pass  # column already exists
         await db.commit()
     finally:
         await db.close()

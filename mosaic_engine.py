@@ -12,7 +12,7 @@ from typing import List, Tuple, Optional
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 # scipy is lazy-imported in _build_voronoi_cells() to save ~150 MB RAM at startup
 
 
@@ -88,9 +88,17 @@ def _hex_grid(w: int, h: int, cell: int):
 # ── Quantization ─────────────────────────────────────────────────────────
 
 def _quantize(img: Image.Image, n: int):
-    pixels = np.array(img).reshape(-1, 3).astype(np.float64)
-    km = KMeans(n_clusters=n, random_state=42, n_init=10)
-    labels = km.fit_predict(pixels)
+    pixels = np.array(img).reshape(-1, 3).astype(np.float32)
+    # Subsample for fast clustering, then predict all pixels
+    MAX_SAMPLES = 50_000
+    if len(pixels) > MAX_SAMPLES:
+        idx = np.random.RandomState(42).choice(len(pixels), MAX_SAMPLES, replace=False)
+        sample = pixels[idx]
+    else:
+        sample = pixels
+    km = MiniBatchKMeans(n_clusters=n, random_state=42, batch_size=1024, n_init=3)
+    km.fit(sample)
+    labels = km.predict(pixels)
     palette = km.cluster_centers_.astype(np.uint8)
 
     # Shuffle so number order doesn't reveal the image
@@ -367,8 +375,12 @@ class Preset:
     landscape: bool = False
     crop: Optional[str] = None       # "L,T,R,B" %
     blur: int = 0
-    mode: str = "hex"                # "hex" or "voronoi"
+    mode: str = "hex"                # "hex" or "voronoi" or "cbn" or "lineart"
+    lineart_detail: str = "standard"   # Line art: simple/standard/detailed/expert
+    lineart_thickness: int = 2         # Line art: line thickness 1-4
     voronoi_density: str = "standard"  # easy/standard/detailed/expert
+    min_zone_pixels: int = 500         # CBN: minimum zone size in pixels
+    epsilon_factor: float = 0.002      # CBN: contour simplification factor
 
 PRESETS = {
     "kdp-letter": Preset("kdp-letter", "KDP 8.5×11 no bleed", "letter", 25, 12),
@@ -381,6 +393,21 @@ PRESETS = {
     "voronoi-standard": Preset("voronoi-standard", "Organic Mosaic (standard)", "letter", 0, 12, mode="voronoi", voronoi_density="standard"),
     "voronoi-detailed": Preset("voronoi-detailed", "Organic Mosaic (detailed)", "letter", 0, 16, mode="voronoi", voronoi_density="detailed"),
     "voronoi-expert":   Preset("voronoi-expert",   "Organic Mosaic (expert)",   "letter", 0, 20, mode="voronoi", voronoi_density="expert"),
+    # Color by Number presets
+    "cbn-kids":     Preset("cbn-kids",     "CBN Kids (easy)",    "letter", 0, 6,  blur=3, mode="cbn", min_zone_pixels=1000),
+    "cbn-standard": Preset("cbn-standard", "CBN Standard",       "letter", 0, 10, blur=2, mode="cbn", min_zone_pixels=500),
+    "cbn-detailed": Preset("cbn-detailed", "CBN Detailed",       "letter", 0, 14, blur=1, mode="cbn", min_zone_pixels=300),
+    "cbn-a4":       Preset("cbn-a4",       "CBN A4 Print-ready", "a4",     0, 10, blur=2, mode="cbn", min_zone_pixels=500),
+    # Line Art presets
+    "lineart-simple":   Preset("lineart-simple",   "Line Art Simple (Kids 3-6)",  "letter", 0, 0, mode="lineart", lineart_detail="simple",   lineart_thickness=3),
+    "lineart-standard": Preset("lineart-standard", "Line Art Standard",           "letter", 0, 0, mode="lineart", lineart_detail="standard", lineart_thickness=2),
+    "lineart-detailed": Preset("lineart-detailed", "Line Art Detailed",           "letter", 0, 0, mode="lineart", lineart_detail="detailed", lineart_thickness=2),
+    "lineart-expert":   Preset("lineart-expert",   "Line Art Expert",             "letter", 0, 0, mode="lineart", lineart_detail="expert",   lineart_thickness=1),
+    # Paint by Number presets (Potrace Bezier curves)
+    "pbn-kids":     Preset("pbn-kids",     "PBN Kids (easy)",    "letter", 0, 6,  blur=3, mode="pbn", min_zone_pixels=1200),
+    "pbn-standard": Preset("pbn-standard", "PBN Standard",       "letter", 0, 12, blur=2, mode="pbn", min_zone_pixels=500),
+    "pbn-detailed": Preset("pbn-detailed", "PBN Detailed",       "letter", 0, 20, blur=1, mode="pbn", min_zone_pixels=300),
+    "pbn-a4":       Preset("pbn-a4",       "PBN A4 Print-ready", "a4",     0, 12, blur=2, mode="pbn", min_zone_pixels=500),
 }
 
 
@@ -396,6 +423,724 @@ class MosaicResult:
     hex_count: int
     color_count: int
     palette: list              # list of (r,g,b) tuples
+
+
+@dataclass
+class LineArtResult:
+    line_art_svg: str            # SVG: black contours on white
+    line_art_png: Image.Image    # PNG: 300 DPI print-ready
+    preview_png: Image.Image     # PNG: lower-res for browser preview
+    detail_level: str
+    line_count: int
+
+
+@dataclass
+class CBNResult:
+    mystery_svg: str              # SVG: numbered outlines (B&W)
+    mystery_png: Image.Image      # PNG render of mystery
+    answer_svg: str               # SVG: colored regions
+    answer_png: Image.Image       # PNG render of answer
+    legend_png: Image.Image       # Color legend
+    mystery_full_png: Image.Image # mystery + legend stacked
+    zone_count: int
+    color_count: int
+    palette: list                 # list of (r,g,b) tuples
+
+
+@dataclass
+class PBNResult:
+    mystery_svg: str              # SVG: white zones, numbered, Bezier outlines
+    mystery_png: Image.Image      # PNG render of mystery (300 DPI)
+    answer_svg: str               # SVG: colored zones, Bezier outlines
+    answer_png: Image.Image       # PNG render of answer
+    legend_png: Image.Image       # Color legend
+    mystery_full_png: Image.Image # mystery + legend stacked
+    zone_count: int
+    color_count: int
+    palette: list                 # list of (r,g,b) tuples
+
+
+# ── Color by Number helpers ──────────────────────────────────────────────
+
+def _cbn_find_zones(
+    label_map: np.ndarray,
+    n_colors: int,
+    min_zone_pixels: int = 500,
+) -> Tuple[np.ndarray, list]:
+    """Find connected zones per color in the quantized label map.
+
+    Returns (zone_map, zones) where:
+      - zone_map: int32 array, each pixel → zone_id (0 = unassigned/too small)
+      - zones: list of {"id", "color", "centroid", "area"} dicts
+
+    Optimized: uses find_objects() for fast bounding-box slicing instead of
+    scanning the full image per zone.
+    """
+    from scipy import ndimage  # lazy import
+
+    h, w = label_map.shape
+    zone_map = np.zeros((h, w), dtype=np.int32)
+    zones = []
+    zone_id = 0
+
+    for ci in range(n_colors):
+        binary = (label_map == ci).astype(np.uint8)
+        labeled, n_features = ndimage.label(binary)
+
+        # find_objects gives bounding box slices for each component — avoids full scans
+        slices = ndimage.find_objects(labeled)
+
+        for rid, sl in enumerate(slices, start=1):
+            if sl is None:
+                continue
+            # Work within the bounding box only
+            crop = labeled[sl]
+            crop_mask = (crop == rid)
+            area = int(crop_mask.sum())
+            if area < min_zone_pixels:
+                continue
+
+            zone_id += 1
+            zone_map[sl][crop_mask] = zone_id
+
+            # Centroid within the crop, then offset to full image coords
+            ys, xs = np.where(crop_mask)
+            cy = int(ys.mean()) + sl[0].start
+            cx = int(xs.mean()) + sl[1].start
+
+            # Ensure centroid is inside the zone
+            if cy < 0 or cy >= h or cx < 0 or cx >= w or not (zone_map[cy, cx] == zone_id):
+                # Offset ys/xs to full coords
+                ys_full = ys + sl[0].start
+                xs_full = xs + sl[1].start
+                dists = (ys_full - cy) ** 2 + (xs_full - cx) ** 2
+                nearest = np.argmin(dists)
+                cy, cx = int(ys_full[nearest]), int(xs_full[nearest])
+
+            zones.append({
+                "id": zone_id,
+                "color": ci,
+                "centroid": (cy, cx),
+                "area": area,
+            })
+
+        del labeled
+    return zone_map, zones
+
+
+def generate_cbn(
+    img: Image.Image,
+    colors: int = 10,
+    page: str = "letter",
+    landscape: bool = False,
+    crop: Optional[str] = None,
+    blur: int = 2,
+    min_zone_pixels: int = 500,
+) -> CBNResult:
+    """Generate a Color-by-Number page from a PIL Image.
+
+    Pipeline: preprocess → quantize → find zones → Potrace trace →
+              render SVG + PNG → legend → return CBNResult.
+    """
+    img = img.convert("RGB")
+
+    # Crop
+    if crop:
+        parts = [float(x) for x in crop.split(",")]
+        if len(parts) == 4:
+            lp, tp, rp, bp = parts
+            w, h = img.size
+            img = img.crop((
+                int(w * lp / 100), int(h * tp / 100),
+                int(w * (100 - rp) / 100), int(h * (100 - bp) / 100),
+            ))
+
+    # Blur (smooths noise in photos → cleaner zones)
+    if blur > 0:
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+
+    # Fit to page
+    if page and page in PAGE_SIZES:
+        pw, ph = PAGE_SIZES[page]
+        if landscape:
+            pw, ph = ph, pw
+        margin = 50
+        tw, th = pw - 2 * margin, ph - 2 * margin
+        s = min(tw / img.size[0], th / img.size[1])
+        img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), Image.LANCZOS)
+
+    w, h = img.size
+
+    # Quantize
+    label_map, palette = _quantize(img, colors)
+
+    # Find zones
+    zone_map, zones = _cbn_find_zones(label_map, colors, min_zone_pixels)
+    del label_map
+
+    # Extract contours with Potrace (smooth Bezier curves)
+    zones = _pbn_extract_paths(zone_map, zones)
+
+    # Render SVG
+    mystery_svg = _pbn_to_svg(zones, palette, w, h, show_colors=False, show_numbers=True)
+    answer_svg = _pbn_to_svg(zones, palette, w, h, show_colors=True, show_numbers=False)
+
+    # Render PNG
+    mystery_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=False, show_numbers=True)
+    answer_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=True, show_numbers=False)
+    del zone_map
+
+    # Legend + combined
+    legend_png = _make_legend(palette, w)
+    mystery_full_png = _stack(mystery_png, legend_png)
+
+    pal_list = [tuple(int(c) for c in row) for row in palette]
+
+    gc.collect()
+    return CBNResult(
+        mystery_svg=mystery_svg,
+        mystery_png=mystery_png,
+        answer_svg=answer_svg,
+        answer_png=answer_png,
+        legend_png=legend_png,
+        mystery_full_png=mystery_full_png,
+        zone_count=len(zones),
+        color_count=colors,
+        palette=pal_list,
+    )
+
+
+# ── Paint by Number helpers (Potrace) ──────────────────────────────────
+
+def _pbn_trace_zone(
+    zone_mask_crop: np.ndarray,
+    offset_x: int,
+    offset_y: int,
+    turdsize: int = 2,
+    opticurve: bool = True,
+    opttolerance: float = 0.2,
+) -> list:
+    """Trace a single zone's binary mask crop with Potrace.
+
+    Returns list of {"d": str} dicts where "d" is an SVG path data string
+    with M/C/L/z commands (cubic Bezier curves from Potrace).
+    """
+    from potrace import Bitmap  # lazy import (potracer package)
+
+    # Potrace expects a PIL Image; blacklevel=0.5 thresholds at 128
+    pil_mask = Image.fromarray(zone_mask_crop, mode="L")
+    bm = Bitmap(pil_mask, blacklevel=0.5)
+    plist = bm.trace(
+        turdsize=turdsize,
+        opticurve=opticurve,
+        opttolerance=opttolerance,
+    )
+
+    paths = []
+    for curve in plist:
+        sp = curve.start_point
+        sx = sp.x + offset_x
+        sy = sp.y + offset_y
+        d_parts = [f"M{sx:.1f},{sy:.1f}"]
+
+        for seg in curve.segments:
+            if seg.is_corner:
+                a = seg.c
+                b = seg.end_point
+                d_parts.append(
+                    f"L{a.x + offset_x:.1f},{a.y + offset_y:.1f} "
+                    f"L{b.x + offset_x:.1f},{b.y + offset_y:.1f}"
+                )
+            else:
+                c1 = seg.c1
+                c2 = seg.c2
+                ep = seg.end_point
+                d_parts.append(
+                    f"C{c1.x + offset_x:.1f},{c1.y + offset_y:.1f} "
+                    f"{c2.x + offset_x:.1f},{c2.y + offset_y:.1f} "
+                    f"{ep.x + offset_x:.1f},{ep.y + offset_y:.1f}"
+                )
+
+        d_parts.append("z")
+        paths.append({"d": " ".join(d_parts)})
+
+    del bm, plist
+    return paths
+
+
+def _pbn_extract_paths(
+    zone_map: np.ndarray,
+    zones: list,
+    turdsize: int = 2,
+    opticurve: bool = True,
+    opttolerance: float = 0.2,
+) -> list:
+    """Extract Potrace Bezier paths for each zone.
+
+    Adds "paths" key to each zone dict: list of {"d": str} SVG path strings.
+    Uses Potrace for smooth Bezier curve extraction.
+    """
+    from scipy import ndimage  # lazy import
+
+    max_id = max(z["id"] for z in zones) if zones else 0
+    slices = ndimage.find_objects(zone_map.clip(0, max_id).astype(np.int32))
+
+    for zone in zones:
+        zid = zone["id"]
+        sl = slices[zid - 1] if zid - 1 < len(slices) else None
+
+        if sl is None:
+            zone["paths"] = []
+            continue
+
+        # Binary mask crop for this zone (0/255)
+        crop = (zone_map[sl] == zid).astype(np.uint8) * 255
+        oy, ox = sl[0].start, sl[1].start
+
+        zone["paths"] = _pbn_trace_zone(
+            crop, ox, oy, turdsize, opticurve, opttolerance
+        )
+        del crop
+
+    return zones
+
+
+def _pbn_to_svg(
+    zones: list,
+    palette: np.ndarray,
+    w: int,
+    h: int,
+    show_colors: bool = False,
+    show_numbers: bool = True,
+) -> str:
+    """Render PBN zones as SVG with smooth Bezier curves from Potrace.
+
+    Uses fill-rule="evenodd" for proper hole rendering.
+    """
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {w} {h}" width="{w}" height="{h}">\n',
+        '<rect width="100%" height="100%" fill="white"/>\n',
+        '<style>\n',
+        '  .zone { stroke: #222; stroke-width: 1.2; stroke-linejoin: round; stroke-linecap: round; }\n',
+    ]
+    if show_numbers:
+        parts.append(
+            '  .num { font-family: Arial, Helvetica, sans-serif; '
+            'font-weight: bold; text-anchor: middle; '
+            'dominant-baseline: central; fill: #333; }\n'
+        )
+    parts.append('</style>\n')
+
+    # Draw zones with Bezier paths
+    for zone in zones:
+        ci = zone["color"]
+        r, g, b = int(palette[ci][0]), int(palette[ci][1]), int(palette[ci][2])
+        fill = f"rgb({r},{g},{b})" if show_colors else "white"
+
+        d_combined = " ".join(p["d"] for p in zone["paths"])
+        if d_combined:
+            parts.append(
+                f'<path class="zone" fill-rule="evenodd" '
+                f'd="{d_combined}" fill="{fill}"/>\n'
+            )
+
+    # Numbers layer (on top)
+    if show_numbers:
+        for zone in zones:
+            ci = zone["color"]
+            cy, cx = zone["centroid"]
+            num = str(ci + 1)
+            area = zone["area"]
+
+            fs = max(8, min(28, int(14 * (area / 3000) ** 0.25)))
+            r_bg = fs * 0.55 * max(1.0, len(num) * 0.6)
+
+            parts.append(
+                f'<circle cx="{cx}" cy="{cy}" r="{r_bg:.0f}" '
+                f'fill="white" fill-opacity="0.85" stroke="none"/>\n'
+            )
+            parts.append(
+                f'<text class="num" x="{cx}" y="{cy}" '
+                f'font-size="{fs}">{num}</text>\n'
+            )
+
+    parts.append('</svg>')
+    return ''.join(parts)
+
+
+def _pbn_render_png(
+    zone_map: np.ndarray,
+    zones: list,
+    palette: np.ndarray,
+    w: int,
+    h: int,
+    show_colors: bool = False,
+    show_numbers: bool = True,
+) -> Image.Image:
+    """Render PBN zones to PNG using numpy (no OpenCV).
+
+    Colors via direct zone_map indexing; outlines via morphological erosion.
+    """
+    from scipy import ndimage  # lazy import
+
+    arr = np.full((h, w, 3), 255, dtype=np.uint8)
+    struct = np.ones((3, 3), dtype=bool)
+
+    # Paint all zones
+    for zone in zones:
+        ci = zone["color"]
+        mask = (zone_map == zone["id"])
+        if show_colors:
+            arr[mask] = palette[ci]
+        # Outline: erode mask, XOR to get boundary pixels
+        eroded = ndimage.binary_erosion(mask, structure=struct)
+        boundary = mask & ~eroded
+        arr[boundary] = [30, 30, 30]
+
+    img = Image.fromarray(arr, "RGB")
+    del arr
+
+    # Draw numbers with Pillow
+    if show_numbers:
+        draw = ImageDraw.Draw(img)
+        for zone in zones:
+            ci = zone["color"]
+            cy, cx = zone["centroid"]
+            num = str(ci + 1)
+            area = zone["area"]
+
+            fs = max(8, min(28, int(14 * (area / 3000) ** 0.25)))
+            font = _get_font(fs)
+            bb = draw.textbbox((0, 0), num, font=font)
+            tw_txt, th_txt = bb[2] - bb[0], bb[3] - bb[1]
+
+            tx = cx - tw_txt // 2
+            ty = cy - th_txt // 2
+
+            pad = 3
+            draw.ellipse(
+                [tx - pad, ty - pad, tx + tw_txt + pad, ty + th_txt + pad],
+                fill=(255, 255, 255), outline=(200, 200, 200),
+            )
+            draw.text((tx, ty), num, fill=(60, 60, 60), font=font)
+
+    return img
+
+
+def generate_pbn(
+    img: Image.Image,
+    colors: int = 10,
+    page: str = "letter",
+    landscape: bool = False,
+    crop: Optional[str] = None,
+    blur: int = 2,
+    min_zone_pixels: int = 500,
+    turdsize: int = 2,
+    opticurve: bool = True,
+    opttolerance: float = 0.2,
+) -> PBNResult:
+    """Generate a Paint-by-Numbers page using Potrace for smooth Bezier curves.
+
+    Pipeline: preprocess → quantize → find zones → Potrace trace →
+              render SVG + PNG → legend → return PBNResult.
+    """
+    img = img.convert("RGB")
+
+    # Crop
+    if crop:
+        parts = [float(x) for x in crop.split(",")]
+        if len(parts) == 4:
+            lp, tp, rp, bp = parts
+            w, h = img.size
+            img = img.crop((
+                int(w * lp / 100), int(h * tp / 100),
+                int(w * (100 - rp) / 100), int(h * (100 - bp) / 100),
+            ))
+
+    # Blur (smooths noise → cleaner zones)
+    if blur > 0:
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+
+    # Fit to page
+    if page and page in PAGE_SIZES:
+        pw, ph = PAGE_SIZES[page]
+        if landscape:
+            pw, ph = ph, pw
+        margin = 50
+        tw, th = pw - 2 * margin, ph - 2 * margin
+        s = min(tw / img.size[0], th / img.size[1])
+        img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), Image.LANCZOS)
+
+    w, h = img.size
+
+    # Quantize
+    label_map, palette = _quantize(img, colors)
+
+    # Find connected zones
+    zone_map, zones = _cbn_find_zones(label_map, colors, min_zone_pixels)
+    del label_map
+
+    # Extract Potrace Bezier paths
+    zones = _pbn_extract_paths(zone_map, zones, turdsize, opticurve, opttolerance)
+
+    # Render SVG
+    mystery_svg = _pbn_to_svg(zones, palette, w, h, show_colors=False, show_numbers=True)
+    answer_svg = _pbn_to_svg(zones, palette, w, h, show_colors=True, show_numbers=False)
+
+    # Render PNG (from zone_map, no OpenCV)
+    mystery_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=False, show_numbers=True)
+    answer_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=True, show_numbers=False)
+    del zone_map
+
+    # Legend + combined
+    legend_png = _make_legend(palette, w)
+    mystery_full_png = _stack(mystery_png, legend_png)
+
+    pal_list = [tuple(int(c) for c in row) for row in palette]
+
+    gc.collect()
+    return PBNResult(
+        mystery_svg=mystery_svg,
+        mystery_png=mystery_png,
+        answer_svg=answer_svg,
+        answer_png=answer_png,
+        legend_png=legend_png,
+        mystery_full_png=mystery_full_png,
+        zone_count=len(zones),
+        color_count=colors,
+        palette=pal_list,
+    )
+
+
+# ── Line Art helpers ────────────────────────────────────────────────────
+
+# Line art presets: (canny_lo, canny_hi, bilateral_d, sigma_color, sigma_space, passes)
+# Uses Canny + large morphological close (5x5) to merge double edges cleanly.
+_LINEART_PRESETS = {
+    # (canny_lo, canny_hi, median_size, smooth_passes, gauss_sigma)
+    "simple":   (55, 130, 9, 3, 2.0),   # Kids 3-6: smooth, bold outlines
+    "standard": (40, 100, 7, 2, 1.5),   # General: clean outlines
+    "detailed": (25,  75, 5, 1, 1.2),   # Teens/adults: more detail
+    "expert":   (15,  50, 3, 1, 1.0),   # Maximum detail
+}
+
+
+def _lineart_edges_to_svg(
+    edges: np.ndarray,
+    turdsize: int = 5,
+) -> Tuple[str, int]:
+    """Convert a binary edge image to SVG paths using Potrace.
+
+    Traces the edge bitmap into smooth Bezier curves.
+    Returns (svg_string, line_count).
+    """
+    from potrace import Bitmap  # lazy import
+
+    h, w = edges.shape
+    pil_edges = Image.fromarray(edges, mode="L")
+    bm = Bitmap(pil_edges, blacklevel=0.5)
+    plist = bm.trace(turdsize=turdsize, opticurve=True, opttolerance=0.2)
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'viewBox="0 0 {w} {h}" width="{w}" height="{h}">\n',
+        '<rect width="100%" height="100%" fill="white"/>\n',
+    ]
+
+    line_count = 0
+    for curve in plist:
+        sp = curve.start_point
+        d_parts = [f"M{sp.x:.1f},{sp.y:.1f}"]
+
+        for seg in curve.segments:
+            if seg.is_corner:
+                a = seg.c
+                b = seg.end_point
+                d_parts.append(
+                    f"L{a.x:.1f},{a.y:.1f} L{b.x:.1f},{b.y:.1f}"
+                )
+            else:
+                c1 = seg.c1
+                c2 = seg.c2
+                ep = seg.end_point
+                d_parts.append(
+                    f"C{c1.x:.1f},{c1.y:.1f} "
+                    f"{c2.x:.1f},{c2.y:.1f} "
+                    f"{ep.x:.1f},{ep.y:.1f}"
+                )
+
+        d_parts.append("z")
+        d = " ".join(d_parts)
+        parts.append(
+            f'<path d="{d}" fill="none" stroke="#000" '
+            f'stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>\n'
+        )
+        line_count += 1
+
+    del bm, plist
+    parts.append('</svg>')
+    return ''.join(parts), line_count
+
+
+def _lineart_edges_to_png(edges: np.ndarray, w: int, h: int) -> Image.Image:
+    """Convert binary edge image (white edges on black) to PNG (black lines on white)."""
+    # Invert: edges are 255 (white), we want black lines on white
+    inverted = 255 - edges
+    return Image.fromarray(inverted).convert("RGB")
+
+
+def _canny_scipy(
+    gray: np.ndarray,
+    low: int,
+    high: int,
+    sigma: float = 1.4,
+) -> np.ndarray:
+    """Canny-like edge detection using scipy (no OpenCV).
+
+    Gaussian blur → Sobel gradients → non-maximum suppression →
+    hysteresis via connected components.
+    Returns binary edge image (0/255 uint8).
+    """
+    from scipy.ndimage import gaussian_filter, sobel, label
+
+    smoothed = gaussian_filter(gray.astype(np.float64), sigma=sigma)
+
+    gx = sobel(smoothed, axis=1)
+    gy = sobel(smoothed, axis=0)
+    mag = np.hypot(gx, gy)
+
+    # Normalize using 99th percentile (robust to outlier gradients)
+    p99 = np.percentile(mag, 99)
+    if p99 > 0:
+        mag = np.clip(mag * 255.0 / p99, 0, 255)
+
+    # Non-maximum suppression (fully vectorized)
+    angle = np.degrees(np.arctan2(gy, gx)) % 180
+    h, w = mag.shape
+    mag_pad = np.pad(mag, 1, mode="constant")
+    nms = np.zeros((h, w), dtype=np.float64)
+
+    for mask_fn, dy1, dx1, dy2, dx2 in [
+        (lambda a: (a < 22.5) | (a >= 157.5),  0, -1,  0,  1),
+        (lambda a: (a >= 22.5) & (a < 67.5),  -1,  1,  1, -1),
+        (lambda a: (a >= 67.5) & (a < 112.5), -1,  0,  1,  0),
+        (lambda a: (a >= 112.5) & (a < 157.5),-1, -1,  1,  1),
+    ]:
+        mask = mask_fn(angle)
+        n1 = mag_pad[1 + dy1:h + 1 + dy1, 1 + dx1:w + 1 + dx1]
+        n2 = mag_pad[1 + dy2:h + 1 + dy2, 1 + dx2:w + 1 + dx2]
+        keep = mask & (mag >= n1) & (mag >= n2)
+        nms[keep] = mag[keep]
+
+    # Hysteresis via connected-component labelling
+    strong = nms >= high
+    weak = (nms >= low) & ~strong
+    combined = strong | weak
+    labeled, _ = label(combined)
+    # Keep every connected region that touches at least one strong pixel
+    strong_labels = set(labeled[strong].ravel())
+    strong_labels.discard(0)
+    edges = np.isin(labeled, list(strong_labels))
+
+    return (edges.astype(np.uint8) * 255)
+
+
+def _disk_kernel(size: int) -> np.ndarray:
+    """Create a disk-shaped structuring element (replaces cv2 MORPH_ELLIPSE)."""
+    r = size // 2
+    y, x = np.ogrid[-r:r + 1, -r:r + 1]
+    return (x * x + y * y <= r * r).astype(bool)
+
+
+def generate_line_art(
+    img: Image.Image,
+    page: str = "letter",
+    landscape: bool = False,
+    crop: Optional[str] = None,
+    detail_level: str = "standard",
+    line_thickness: int = 2,
+) -> LineArtResult:
+    """Convert a photo to a line-art coloring page.
+
+    Pipeline: preprocess → grayscale → median filter (multi-pass) →
+              Canny edge detection (scipy) → morphological close →
+              optional dilation → Potrace SVG + PNG.
+    """
+    from scipy.ndimage import median_filter, binary_closing, binary_dilation
+
+    img = img.convert("RGB")
+
+    # Crop
+    if crop:
+        parts = [float(x) for x in crop.split(",")]
+        if len(parts) == 4:
+            lp, tp, rp, bp = parts
+            w, h = img.size
+            img = img.crop((
+                int(w * lp / 100), int(h * tp / 100),
+                int(w * (100 - rp) / 100), int(h * (100 - bp) / 100),
+            ))
+
+    # Fit to page
+    if page and page in PAGE_SIZES:
+        pw, ph = PAGE_SIZES[page]
+        if landscape:
+            pw, ph = ph, pw
+        margin = 50
+        tw, th = pw - 2 * margin, ph - 2 * margin
+        s = min(tw / img.size[0], th / img.size[1])
+        img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), Image.LANCZOS)
+
+    w, h = img.size
+
+    # Grayscale via Pillow
+    gray = np.array(img.convert("L"))
+
+    # Load preset
+    preset = _LINEART_PRESETS.get(detail_level, _LINEART_PRESETS["standard"])
+    canny_lo, canny_hi, median_sz, passes, gauss_sigma = preset
+
+    # Median filter (edge-preserving smoothing)
+    for _ in range(passes):
+        gray = median_filter(gray, size=median_sz)
+
+    # Canny edge detection (scipy implementation)
+    edges = _canny_scipy(gray, canny_lo, canny_hi, sigma=gauss_sigma)
+
+    # Morphological close with 5x5 disk: merges double-edge lines
+    kernel_close = _disk_kernel(5)
+    edges = (binary_closing(edges > 0, structure=kernel_close) * 255).astype(np.uint8)
+
+    # Line thickness control via dilation
+    if line_thickness > 1:
+        kernel_dilate = _disk_kernel(line_thickness)
+        edges = (binary_dilation(edges > 0, structure=kernel_dilate, iterations=1) * 255).astype(np.uint8)
+
+    # Generate SVG with Potrace (smooth Bezier curves)
+    turdsize = {"simple": 15, "standard": 8, "detailed": 4, "expert": 2}.get(detail_level, 8)
+    line_art_svg, line_count = _lineart_edges_to_svg(edges, turdsize=turdsize)
+
+    # Generate PNG (black lines on white)
+    line_art_png = _lineart_edges_to_png(edges, w, h)
+
+    # Lower-res preview for browser (max 800px wide)
+    preview_scale = min(1.0, 800 / w)
+    if preview_scale < 1.0:
+        pw_prev = int(w * preview_scale)
+        ph_prev = int(h * preview_scale)
+        preview_png = line_art_png.resize((pw_prev, ph_prev), Image.LANCZOS)
+    else:
+        preview_png = line_art_png.copy()
+
+    gc.collect()
+    return LineArtResult(
+        line_art_svg=line_art_svg,
+        line_art_png=line_art_png,
+        preview_png=preview_png,
+        detail_level=detail_level,
+        line_count=line_count,
+    )
 
 
 def generate(
@@ -645,9 +1390,22 @@ def cells_and_avg_colors(cells, pixels, w, h):
         yield (verts, area, lbl_pt, tuple(int(c) for c in avg))
 
 
-def generate_from_preset(img: Image.Image, preset_name: str) -> MosaicResult:
-    """Convenience: generate using a named preset."""
+def generate_from_preset(img: Image.Image, preset_name: str):
+    """Convenience: generate using a named preset. Returns MosaicResult, CBNResult, or LineArtResult."""
     p = PRESETS[preset_name]
+    if p.mode == "lineart":
+        return generate_line_art(img, page=p.page, landscape=p.landscape,
+                                 crop=p.crop, detail_level=p.lineart_detail,
+                                 line_thickness=p.lineart_thickness)
+    if p.mode == "cbn":
+        return generate_cbn(img, colors=p.colors, page=p.page,
+                            landscape=p.landscape, crop=p.crop, blur=p.blur,
+                            min_zone_pixels=p.min_zone_pixels,
+                            epsilon_factor=p.epsilon_factor)
+    if p.mode == "pbn":
+        return generate_pbn(img, colors=p.colors, page=p.page,
+                            landscape=p.landscape, crop=p.crop, blur=p.blur,
+                            min_zone_pixels=p.min_zone_pixels)
     if p.mode == "voronoi":
         density_map = VORONOI_DENSITIES.get(p.page, VORONOI_DENSITIES["letter"])
         density = density_map.get(p.voronoi_density, 500)
@@ -696,22 +1454,50 @@ def _stack(top: Image.Image, bottom: Image.Image, gap: int = 10) -> Image.Image:
 
 # ── ZIP helper (for bulk) ───────────────────────────────────────────────
 
-def images_to_zip(results: List[Tuple[str, MosaicResult]]) -> bytes:
-    """Pack multiple MosaicResults into a ZIP (in memory).
-    results = [(name, MosaicResult), ...]
+def images_to_zip(results: list, include_answer: bool = True) -> bytes:
+    """Pack multiple results into a ZIP (in memory).
+    results = [(name, MosaicResult | CBNResult | PBNResult | LineArtResult), ...]
     """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, res in results:
-            for suffix, img in [
-                ("mystery", res.mystery),
-                ("mystery-full", res.mystery_full),
-                ("answer", res.answer),
-                ("beauty", res.beauty),
-                ("legend", res.legend),
-            ]:
+            if isinstance(res, LineArtResult):
+                # SVG + PNG
+                zf.writestr(f"{name}/{name}-lineart.svg", res.line_art_svg)
                 img_buf = io.BytesIO()
-                img.save(img_buf, format="PNG", dpi=(300, 300))
-                zf.writestr(f"{name}/{name}-{suffix}.png", img_buf.getvalue())
+                res.line_art_png.save(img_buf, format="PNG", dpi=(300, 300))
+                zf.writestr(f"{name}/{name}-lineart.png", img_buf.getvalue())
+            elif isinstance(res, (CBNResult, PBNResult)):
+                # SVG files
+                zf.writestr(f"{name}/{name}-mystery.svg", res.mystery_svg)
+                if include_answer:
+                    zf.writestr(f"{name}/{name}-answer.svg", res.answer_svg)
+                # PNG files
+                for suffix, img in [
+                    ("mystery", res.mystery_png),
+                    ("mystery-full", res.mystery_full_png),
+                    ("legend", res.legend_png),
+                ]:
+                    img_buf = io.BytesIO()
+                    img.save(img_buf, format="PNG", dpi=(300, 300))
+                    zf.writestr(f"{name}/{name}-{suffix}.png", img_buf.getvalue())
+                if include_answer:
+                    img_buf = io.BytesIO()
+                    res.answer_png.save(img_buf, format="PNG", dpi=(300, 300))
+                    zf.writestr(f"{name}/{name}-answer.png", img_buf.getvalue())
+            else:
+                # MosaicResult (hex/voronoi)
+                items = [
+                    ("mystery", res.mystery),
+                    ("mystery-full", res.mystery_full),
+                    ("beauty", res.beauty),
+                    ("legend", res.legend),
+                ]
+                if include_answer:
+                    items.insert(2, ("answer", res.answer))
+                for suffix, img in items:
+                    img_buf = io.BytesIO()
+                    img.save(img_buf, format="PNG", dpi=(300, 300))
+                    zf.writestr(f"{name}/{name}-{suffix}.png", img_buf.getvalue())
     buf.seek(0)
     return buf.getvalue()
