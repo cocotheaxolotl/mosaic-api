@@ -75,8 +75,8 @@ BREVO_API_KEY = os.environ.get("BREVO_API_KEY", _BK)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "noreply@univers.studio")
 SENDER_NAME = os.environ.get("SENDER_NAME", "Univers Studio")
 API_PUBLIC_URL = os.environ.get("API_PUBLIC_URL", "https://mosaic-api.fly.dev")
-DOWNLOAD_TTL = 3600        # download links expire after 1 hour
-DOWNLOAD_MAX_ENTRIES = 15   # max ZIPs stored in memory
+DOWNLOAD_TTL = 86400       # download links expire after 24 hours
+DOWNLOAD_MAX_ENTRIES = 50   # max ZIPs stored on disk
 
 # ── App ──────────────────────────────────────────────────────────────────
 
@@ -897,7 +897,7 @@ def _send_brevo_email(to_email: str, download_url: str, mode: str = "hex"):
     {btn_text}
   </a>
   <p style="color:#9ca3af;font-size:.85em;margin:24px 0 0;line-height:1.5">
-    This link expires in 1 hour and can only be used once.<br>
+    This link expires in 24 hours.<br>
     If the link has expired, simply generate a new one on
     <a href="https://univers.studio" style="color:#7c3aed">univers.studio</a>.
   </p>
@@ -1087,15 +1087,12 @@ def download_mosaic(token: str):
 .box{max-width:400px}.emoji{font-size:3em;margin:0 0 16px}h1{font-size:1.3em;margin:0 0 8px}p{color:#6b7280;line-height:1.6;margin:0 0 20px;font-size:.95em}
 a{display:inline-block;padding:12px 28px;background:#7c3aed;color:#fff;text-decoration:none;border-radius:10px;font-weight:700}</style></head>
 <body><div class="box"><div class="emoji">⏰</div><h1>This link has expired</h1>
-<p>Download links are valid for 1 hour and can only be used once. Generate a new mosaic to get a fresh link.</p>
+<p>Download links are valid for 24 hours. Generate a new mosaic to get a fresh link.</p>
 <a href="https://univers.studio/mosaic/">Generate New Mosaic</a></div></body></html>""",
             status_code=410,
         )
     meta = json.loads(meta_path.read_text())
     zip_bytes = zip_path.read_bytes()
-    # One-time use: delete after serving
-    zip_path.unlink(missing_ok=True)
-    meta_path.unlink(missing_ok=True)
     return StreamingResponse(
         io.BytesIO(zip_bytes),
         media_type="application/zip",
