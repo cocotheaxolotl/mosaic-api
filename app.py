@@ -1432,7 +1432,7 @@ async def qr_create(request: Request, body: dict = Body(...)):
         raise HTTPException(400, "A valid URL is required")
 
     # Consume 1 credit
-    ok = await credits_module.consume_credit(user_id, reason="dynamic_qr", metadata=label)
+    ok, _bal = await credits_module.consume_credits(user_id, 1, "dynamic_qr", {"label": label})
     if not ok:
         raise HTTPException(402, "Not enough credits")
 
