@@ -65,6 +65,19 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_apikeys_user ON api_keys(user_id);
 CREATE INDEX IF NOT EXISTS idx_apikeys_hash ON api_keys(key_hash);
+
+CREATE TABLE IF NOT EXISTS dynamic_qrcodes (
+    id          TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL REFERENCES users(id),
+    short_code  TEXT UNIQUE NOT NULL,
+    target_url  TEXT NOT NULL,
+    label       TEXT DEFAULT '',
+    scan_count  INTEGER DEFAULT 0,
+    created_at  REAL NOT NULL DEFAULT (unixepoch()),
+    updated_at  REAL NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_qr_user ON dynamic_qrcodes(user_id);
+CREATE INDEX IF NOT EXISTS idx_qr_short ON dynamic_qrcodes(short_code);
 """
 
 

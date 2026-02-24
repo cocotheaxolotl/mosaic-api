@@ -97,7 +97,7 @@ app.add_middleware(
         "http://127.0.0.1:8000",
         "http://localhost:3000",
     ],
-    allow_methods=["GET", "POST", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -1408,6 +1408,145 @@ def stats():
     return {"total_generated": _total_generated}
 
 
+# ── Dynamic QR Codes ─────────────────────────────────────────────────────
+
+import string
+import random as _random
+from database import get_db
+
+def _gen_short_code(length=7):
+    chars = string.ascii_lowercase + string.digits
+    return ''.join(_random.choices(chars, k=length))
+
+
+@app.post("/api/qr/create")
+async def qr_create(request: Request, body: dict = Body(...)):
+    """Create a dynamic QR code (costs 1 credit). Returns short_code + redirect URL."""
+    user_id, ident = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Login required to create dynamic QR codes")
+
+    target_url = (body.get("target_url") or "").strip()
+    label = (body.get("label") or "").strip()[:100]
+    if not target_url or not target_url.startswith("http"):
+        raise HTTPException(400, "A valid URL is required")
+
+    # Consume 1 credit
+    ok = await credits_module.consume_credit(user_id, reason="dynamic_qr", metadata=label)
+    if not ok:
+        raise HTTPException(402, "Not enough credits")
+
+    qr_id = str(uuid.uuid4())
+    short_code = _gen_short_code()
+
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO dynamic_qrcodes (id, user_id, short_code, target_url, label) VALUES (?,?,?,?,?)",
+            (qr_id, user_id, short_code, target_url, label)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    redirect_url = f"{API_PUBLIC_URL}/go/{short_code}"
+    return {"id": qr_id, "short_code": short_code, "redirect_url": redirect_url, "target_url": target_url, "label": label, "scan_count": 0}
+
+
+@app.get("/api/qr/list")
+async def qr_list(request: Request):
+    """List all dynamic QR codes for the logged-in user."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Login required")
+
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT id, short_code, target_url, label, scan_count, created_at FROM dynamic_qrcodes WHERE user_id=? ORDER BY created_at DESC",
+            (user_id,)
+        )
+    finally:
+        await db.close()
+
+    return [
+        {
+            "id": r[0], "short_code": r[1], "target_url": r[2],
+            "label": r[3], "scan_count": r[4], "created_at": r[5],
+            "redirect_url": f"{API_PUBLIC_URL}/go/{r[1]}"
+        }
+        for r in rows
+    ]
+
+
+@app.put("/api/qr/{qr_id}")
+async def qr_update(qr_id: str, request: Request, body: dict = Body(...)):
+    """Update the target URL of a dynamic QR code (owner only)."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Login required")
+
+    target_url = (body.get("target_url") or "").strip()
+    if not target_url or not target_url.startswith("http"):
+        raise HTTPException(400, "A valid URL is required")
+
+    db = await get_db()
+    try:
+        cur = await db.execute(
+            "UPDATE dynamic_qrcodes SET target_url=?, updated_at=unixepoch() WHERE id=? AND user_id=?",
+            (target_url, qr_id, user_id)
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, "QR code not found")
+        await db.commit()
+    finally:
+        await db.close()
+
+    return {"ok": True}
+
+
+@app.delete("/api/qr/{qr_id}")
+async def qr_delete(qr_id: str, request: Request):
+    """Delete a dynamic QR code (owner only)."""
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Login required")
+
+    db = await get_db()
+    try:
+        cur = await db.execute("DELETE FROM dynamic_qrcodes WHERE id=? AND user_id=?", (qr_id, user_id))
+        if cur.rowcount == 0:
+            raise HTTPException(404, "QR code not found")
+        await db.commit()
+    finally:
+        await db.close()
+
+    return {"ok": True}
+
+
+@app.get("/go/{short_code}")
+async def qr_redirect(short_code: str):
+    """Public redirect — increments scan counter and redirects to target URL."""
+    db = await get_db()
+    try:
+        row = await db.execute_fetchall(
+            "SELECT target_url FROM dynamic_qrcodes WHERE short_code=?", (short_code,)
+        )
+        if not row:
+            raise HTTPException(404, "QR code not found")
+        target = row[0][0]
+        await db.execute(
+            "UPDATE dynamic_qrcodes SET scan_count = scan_count + 1 WHERE short_code=?",
+            (short_code,)
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=target, status_code=302)
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "2.1.0"}
