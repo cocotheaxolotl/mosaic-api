@@ -653,21 +653,21 @@ async def generate_mosaic(
 
     # AI coloring page mode — calls OpenAI, returns immediately (3 credits)
     if mode == "ai":
-        if not user_id:
+        if not user_id and not promo:
             raise HTTPException(403, "AI coloring requires an account. Sign up free at univers.studio!")
-        if not promo:
+        if not promo and user_id:
             balance = await credits_module.get_balance(user_id)
             if balance < 3:
                 raise HTTPException(402, {"error": "Not enough credits", "remaining": balance, "required": 3,
                     "message": "AI coloring costs 3 credits. Upgrade your plan!", "upgrade_url": "https://univers.studio/pricing/"})
         ai_img = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
-        if not promo:
+        if not promo and user_id:
             await credits_module.consume_credits(user_id, 3, "generation", {"mode": "ai", "style": cbn_style})
         return _img_to_streaming(_add_watermark(ai_img), f"{name}-coloring.png")
 
     # Smart CBN: GPT line art + original colors (3 credits, account required)
     if mode in ("cbn", "pbn"):
-        if not user_id:
+        if not user_id and not promo:
             raise HTTPException(403, "Color by Number requires an account. Sign up free at univers.studio!")
         if not promo:
             balance = await credits_module.get_balance(user_id)
