@@ -1643,6 +1643,62 @@ async def api_admin_list_users(secret: str = ""):
         await db.close()
 
 
+@app.get("/api/admin/stats")
+async def api_admin_stats(secret: str = "", days: int = 30):
+    """Admin dashboard: credit consumption stats + API cost estimate."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    db = await get_db()
+    try:
+        # Total consumption by mode (last N days)
+        rows = await db.execute_fetchall(
+            "SELECT json_extract(metadata, '$.mode') as mode, "
+            "COUNT(*) as count, SUM(ABS(delta)) as total_credits "
+            "FROM credit_transactions "
+            "WHERE delta < 0 AND created_at > datetime('now', ? || ' days') "
+            "GROUP BY mode ORDER BY total_credits DESC",
+            (f"-{days}",),
+        )
+        by_mode = [{"mode": r[0] or "unknown", "count": r[1], "credits": r[2]} for r in rows]
+
+        # Daily consumption (last N days)
+        daily = await db.execute_fetchall(
+            "SELECT date(created_at) as day, COUNT(*) as count, SUM(ABS(delta)) as credits "
+            "FROM credit_transactions "
+            "WHERE delta < 0 AND created_at > datetime('now', ? || ' days') "
+            "GROUP BY day ORDER BY day DESC",
+            (f"-{days}",),
+        )
+        by_day = [{"date": r[0], "count": r[1], "credits": r[2]} for r in daily]
+
+        # Recent transactions (last 50)
+        recent = await db.execute_fetchall(
+            "SELECT t.created_at, u.email, t.delta, t.reason, t.metadata "
+            "FROM credit_transactions t LEFT JOIN users u ON u.id = t.user_id "
+            "WHERE t.delta < 0 ORDER BY t.created_at DESC LIMIT 50"
+        )
+        transactions = [
+            {"time": r[0], "email": r[1] or "anonymous", "credits": abs(r[2]), "reason": r[3], "metadata": r[4]}
+            for r in recent
+        ]
+
+        # Estimate API cost (GPT modes = $0.17 each)
+        gpt_modes = sum(r[1] for r in rows if r[0] in ("cbn", "pbn", "ai"))
+        estimated_cost = round(gpt_modes * 0.17, 2)
+
+        return {
+            "period_days": days,
+            "by_mode": by_mode,
+            "by_day": by_day,
+            "recent_transactions": transactions,
+            "estimated_api_cost": f"${estimated_cost}",
+            "total_generations": sum(r[1] for r in rows),
+            "total_credits_consumed": sum(r[2] for r in rows),
+        }
+    finally:
+        await db.close()
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok", "version": "2.2.0"}
