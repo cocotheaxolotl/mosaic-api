@@ -655,21 +655,18 @@ def generate_smart_cbn(
     line_art: Image.Image,
     colors: int = 10,
     page: str = "letter",
-    min_zone_pixels: int = 80,
+    min_zone_pixels: int = 150,
 ) -> CBNResult:
-    """Smart Color-by-Number: use GPT-generated line art + original photo colors.
+    """Smart Color-by-Number: GPT line art + color zones from ORIGINAL image.
 
     Pipeline:
       1. Resize both images to page dimensions
-      2. Threshold line art to binary (Otsu or 128 — clean black/white)
-      3. Morphological close to fill small gaps
-      4. Connected components on white areas → zone map
-      5. For each zone, sample original image → median color at centroid region
-      6. Cluster zone colors into N groups (KMeans)
-      7. Render: line art + numbers overlaid + color legend
+      2. Quantize ORIGINAL image to N colors (KMeans on pixels)
+      3. Build zone map from quantized image (connected components of same color)
+      4. Mystery = GPT line art + numbers at zone centroids
+      5. Answer = quantized original image (clean, vibrant colors)
     """
     from scipy import ndimage
-    from scipy.ndimage import binary_closing
 
     # Determine target size from page
     if page and page in PAGE_SIZES:
@@ -679,134 +676,91 @@ def generate_smart_cbn(
     else:
         tw, th = 2400, 3000
 
-    # Resize line art to fit page
-    la_gray = line_art.convert("L")
-    s = min(tw / la_gray.size[0], th / la_gray.size[1])
-    new_w, new_h = int(la_gray.size[0] * s), int(la_gray.size[1] * s)
-    la_gray = la_gray.resize((new_w, new_h), Image.LANCZOS)
+    # Resize both to fit page
+    s = min(tw / original.size[0], th / original.size[1])
+    new_w, new_h = int(original.size[0] * s), int(original.size[1] * s)
 
-    # Resize original to same dimensions
     orig = original.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
     orig_arr = np.array(orig, dtype=np.float32)
 
-    # ── Create clean black/white line art ──
-    la_arr = np.array(la_gray)
-    # Simple Otsu threshold (no scikit-image dependency)
-    hist, _ = np.histogram(la_arr.ravel(), bins=256, range=(0, 256))
-    total = la_arr.size
-    sum_all = np.dot(np.arange(256), hist)
-    w0, sum0, best_thresh, best_var = 0, 0.0, 128, 0.0
-    for t in range(256):
-        w0 += hist[t]
-        if w0 == 0 or w0 == total:
-            continue
-        sum0 += t * hist[t]
-        m0 = sum0 / w0
-        m1 = (sum_all - sum0) / (total - w0)
-        var = w0 * (total - w0) * (m0 - m1) ** 2
-        if var > best_var:
-            best_var = var
-            best_thresh = t
-    thresh = max(100, min(200, best_thresh))
-    binary = (la_arr >= thresh).astype(np.uint8)
+    la_resized = line_art.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
 
-    # Morphological closing: fill small gaps in zones (3x3 kernel)
-    binary = binary_closing(binary, structure=np.ones((3, 3)), iterations=1).astype(np.uint8)
+    # ── Step 1: Quantize original image to N colors ──
+    # Subsample pixels for KMeans (performance)
+    pixels = orig_arr.reshape(-1, 3)
+    n_px = len(pixels)
+    sample_size = min(n_px, 50000)
+    rng = np.random.RandomState(42)
+    sample_idx = rng.choice(n_px, sample_size, replace=False)
+    sample_pixels = pixels[sample_idx]
 
-    # Create clean black-and-white line art for rendering (no gray)
-    la_clean = np.where(la_arr >= thresh, 255, 0).astype(np.uint8)
-    la_rgb = Image.fromarray(np.stack([la_clean, la_clean, la_clean], axis=-1))
+    n_clusters = min(colors, 20)
+    km = MiniBatchKMeans(n_clusters=n_clusters, random_state=0, n_init=5, batch_size=1024)
+    km.fit(sample_pixels)
+    palette = km.cluster_centers_.astype(np.uint8)
 
-    # Connected components on white zones
-    labeled, n_features = ndimage.label(binary)
-    slices = ndimage.find_objects(labeled)
+    # Assign every pixel to nearest cluster
+    pixel_labels = km.predict(pixels).reshape(new_h, new_w)
 
-    # For each zone, compute color from original (median in centroid region)
+    # Build quantized image (answer key)
+    quantized_arr = palette[pixel_labels]  # shape (h, w, 3)
+
+    # ── Step 2: Find zones (connected components of same color label) ──
     valid_zones = []
-    for rid, sl in enumerate(slices, start=1):
-        if sl is None:
-            continue
-        crop = labeled[sl]
-        mask = (crop == rid)
-        area = int(mask.sum())
-        if area < min_zone_pixels:
-            continue
-
-        # Centroid
-        ys, xs = np.where(mask)
-        cy = int(ys.mean()) + sl[0].start
-        cx = int(xs.mean()) + sl[1].start
-
-        # Sample color: median of a small region around centroid in original
-        r_sample = max(3, int(math.sqrt(area) / 4))
-        y0, y1 = max(0, cy - r_sample), min(new_h, cy + r_sample + 1)
-        x0, x1 = max(0, cx - r_sample), min(new_w, cx + r_sample + 1)
-        sample_patch = orig_arr[y0:y1, x0:x1]
-        # Use only pixels that belong to this zone within the patch
-        patch_labeled = labeled[y0:y1, x0:x1]
-        patch_mask = (patch_labeled == rid)
-        if patch_mask.any():
-            zone_rgb = np.median(sample_patch[patch_mask], axis=0)
-        else:
-            # Fallback: average of entire zone
-            zone_rgb = orig_arr[sl][mask].mean(axis=0)
-
-        valid_zones.append({
-            "label": rid,
-            "avg_color": zone_rgb,
-            "area": area,
-            "centroid": (cy, cx),
-            "slice": sl,
-        })
+    for color_id in range(n_clusters):
+        color_mask = (pixel_labels == color_id).astype(np.uint8)
+        labeled, n_feat = ndimage.label(color_mask)
+        slices = ndimage.find_objects(labeled)
+        for rid, sl in enumerate(slices, start=1):
+            if sl is None:
+                continue
+            crop = labeled[sl]
+            mask = (crop == rid)
+            area = int(mask.sum())
+            if area < min_zone_pixels:
+                continue
+            # Centroid
+            ys, xs = np.where(mask)
+            cy = int(ys.mean()) + sl[0].start
+            cx = int(xs.mean()) + sl[1].start
+            valid_zones.append({
+                "color_id": color_id,
+                "area": area,
+                "centroid": (cy, cx),
+            })
 
     if not valid_zones:
-        # Fallback: return the line art as-is if no zones detected
         legend_png = Image.new("RGB", (new_w, 60), (255, 255, 255))
-        full = _stack(la_rgb, legend_png)
+        full = _stack(la_resized, legend_png)
         return CBNResult(
-            mystery_svg="", mystery_png=la_rgb, answer_svg="", answer_png=la_rgb,
+            mystery_svg="", mystery_png=la_resized, answer_svg="", answer_png=la_resized,
             legend_png=legend_png, mystery_full_png=full,
             zone_count=0, color_count=0, palette=[],
         )
 
-    # Cluster zone colors into `colors` groups
-    all_colors = np.array([z["avg_color"] for z in valid_zones])
-    n_clusters = min(colors, len(valid_zones))
-    km = MiniBatchKMeans(n_clusters=n_clusters, random_state=0, n_init=3, batch_size=256)
-    color_labels = km.fit_predict(all_colors)
-    palette = km.cluster_centers_.astype(np.uint8)
-
-    # ── Render Mystery PNG: clean line art + numbers overlaid ──
-    mystery_img = la_rgb.copy()
+    # ── Step 3: Render Mystery = GPT line art + numbers ──
+    mystery_img = la_resized.copy()
     draw_m = ImageDraw.Draw(mystery_img)
-    for i, vz in enumerate(valid_zones):
-        num = str(int(color_labels[i]) + 1)
+    for vz in valid_zones:
+        num = str(vz["color_id"] + 1)
         cy, cx = vz["centroid"]
-        # Font size proportional to zone area
-        fsize = max(10, min(24, int(math.sqrt(vz["area"]) / 6)))
+        fsize = max(10, min(22, int(math.sqrt(vz["area"]) / 8)))
         font = _get_font(fsize)
         bbox = font.getbbox(num)
         tw2, th2 = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        # White circle behind number for readability
         r = max(tw2, th2) // 2 + 3
         draw_m.ellipse([cx - r, cy - r, cx + r, cy + r], fill="white", outline="black", width=1)
         draw_m.text((cx - tw2 // 2, cy - th2 // 2), num, fill="black", font=font)
 
-    # ── Render Answer PNG: colored fills + clean line overlay ──
-    answer_arr = np.full((new_h, new_w, 3), 255, dtype=np.uint8)
-    for i, vz in enumerate(valid_zones):
-        sl = vz["slice"]
-        crop = labeled[sl]
-        mask = (crop == vz["label"])
-        color = tuple(int(c) for c in palette[color_labels[i]])
-        answer_arr[sl][mask] = color
-
-    # Overlay ONLY the black lines (clean threshold, not gray shading)
-    line_mask = la_clean < 128
-    answer_arr[line_mask] = 0  # Pure black lines
+    # ── Step 4: Render Answer = quantized original + line art overlay ──
+    answer_arr = quantized_arr.copy()
+    # Overlay GPT line art lines (dark pixels only)
+    la_gray = np.array(line_art.convert("L").resize((new_w, new_h), Image.LANCZOS))
+    line_mask = la_gray < 80  # Only the darkest lines
+    answer_arr[line_mask] = 0
     answer_img = Image.fromarray(answer_arr)
 
-    del labeled, answer_arr
+    del pixel_labels, quantized_arr, answer_arr
 
     # ── Legend + combined ──
     legend_png = _make_legend(palette, new_w)
@@ -816,7 +770,7 @@ def generate_smart_cbn(
 
     gc.collect()
     return CBNResult(
-        mystery_svg="",               # No SVG in smart mode (line art is raster)
+        mystery_svg="",
         mystery_png=mystery_img,
         answer_svg="",
         answer_png=answer_img,
