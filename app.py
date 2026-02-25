@@ -632,32 +632,32 @@ async def generate_mosaic(
     img = _read_image(data)
     name = Path(image.filename).stem if image.filename else "mosaic"
 
-    # AI coloring page mode — calls OpenAI, returns immediately (3 credits)
+    # AI coloring page mode — calls OpenAI, returns immediately (10 credits)
     if mode == "ai":
         if not user_id and not promo:
             raise HTTPException(403, "AI coloring requires an account. Sign up free at univers.studio!")
         if not promo and user_id:
             balance = await credits_module.get_balance(user_id)
-            if balance < 3:
-                raise HTTPException(402, {"error": "Not enough credits", "remaining": balance, "required": 3,
-                    "message": "AI coloring costs 3 credits. Upgrade your plan!", "upgrade_url": "https://univers.studio/pricing/"})
+            if balance < 10:
+                raise HTTPException(402, {"error": "Not enough credits", "remaining": balance, "required": 10,
+                    "message": "AI coloring costs 10 credits. Upgrade your plan!", "upgrade_url": "https://univers.studio/pricing/"})
         ai_img = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
         if not promo and user_id:
-            await credits_module.consume_credits(user_id, 3, "generation", {"mode": "ai", "style": cbn_style})
+            await credits_module.consume_credits(user_id, 10, "generation", {"mode": "ai", "style": cbn_style})
         # Watermark only for anonymous free users
         if not user_id and not promo:
             ai_img = _add_watermark(ai_img)
         return _img_to_streaming(ai_img, f"{name}-coloring.png")
 
-    # Smart CBN: GPT line art + original colors (3 credits, account required)
+    # Smart CBN: GPT line art + original colors (10 credits, account required)
     if mode in ("cbn", "pbn"):
         if not user_id and not promo:
             raise HTTPException(403, "Color by Number requires an account. Sign up free at univers.studio!")
         if not promo:
             balance = await credits_module.get_balance(user_id)
-            if balance < 3:
-                raise HTTPException(402, {"error": "Not enough credits", "remaining": balance, "required": 3,
-                    "message": "Color by Number costs 3 credits. Upgrade your plan!", "upgrade_url": "https://univers.studio/pricing/"})
+            if balance < 10:
+                raise HTTPException(402, {"error": "Not enough credits", "remaining": balance, "required": 10,
+                    "message": "Color by Number costs 10 credits. Upgrade your plan!", "upgrade_url": "https://univers.studio/pricing/"})
         colors = max(4, min(20, colors))
         line_art = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
         async with _gen_semaphore:
@@ -689,7 +689,7 @@ async def generate_mosaic(
     # Consume quota — CBN/AI cost 3 credits, others cost 1
     # Promo users bypass consumption
     if not promo:
-        cost = 3 if mode in ("cbn", "pbn") else 1
+        cost = 10 if mode in ("cbn", "pbn") else 1
         if user_id:
             await credits_module.consume_credits(
                 user_id, cost, "generation", {"mode": mode, "preset": preset}
