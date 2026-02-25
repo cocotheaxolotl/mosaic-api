@@ -744,12 +744,12 @@ def generate_smart_cbn(
     for vz in valid_zones:
         num = str(vz["color_id"] + 1)
         cy, cx = vz["centroid"]
-        fsize = max(10, min(22, int(math.sqrt(vz["area"]) / 8)))
+        fsize = max(14, min(32, int(math.sqrt(vz["area"]) / 5)))
         font = _get_font(fsize)
         bbox = font.getbbox(num)
         tw2, th2 = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        r = max(tw2, th2) // 2 + 3
-        draw_m.ellipse([cx - r, cy - r, cx + r, cy + r], fill="white", outline="black", width=1)
+        r = max(tw2, th2) // 2 + 4
+        draw_m.ellipse([cx - r, cy - r, cx + r, cy + r], fill="white", outline="black", width=2)
         draw_m.text((cx - tw2 // 2, cy - th2 // 2), num, fill="black", font=font)
 
     # ── Step 4: Render Answer = quantized original + line art overlay ──

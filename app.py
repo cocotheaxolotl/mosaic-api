@@ -651,17 +651,29 @@ async def generate_mosaic(
     img = _read_image(data)
     name = Path(image.filename).stem if image.filename else "mosaic"
 
-    # AI coloring page mode — calls OpenAI, returns immediately
+    # AI coloring page mode — calls OpenAI, returns immediately (3 credits)
     if mode == "ai":
+        if not user_id:
+            raise HTTPException(403, "AI coloring requires an account. Sign up free at univers.studio!")
+        if not promo:
+            balance = await credits_module.get_balance(user_id)
+            if balance < 3:
+                raise HTTPException(402, {"error": "Not enough credits", "remaining": balance, "required": 3,
+                    "message": "AI coloring costs 3 credits. Upgrade your plan!", "upgrade_url": "https://univers.studio/pricing/"})
         ai_img = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
-        if user_id:
-            await credits_module.consume_credits(user_id, 1, "generation", {"mode": "ai"})
-        else:
-            _consume(request, 1)
+        if not promo:
+            await credits_module.consume_credits(user_id, 3, "generation", {"mode": "ai", "style": cbn_style})
         return _img_to_streaming(_add_watermark(ai_img), f"{name}-coloring.png")
 
-    # Smart CBN: GPT line art + original colors (AI call outside semaphore)
+    # Smart CBN: GPT line art + original colors (3 credits, account required)
     if mode in ("cbn", "pbn"):
+        if not user_id:
+            raise HTTPException(403, "Color by Number requires an account. Sign up free at univers.studio!")
+        if not promo:
+            balance = await credits_module.get_balance(user_id)
+            if balance < 3:
+                raise HTTPException(402, {"error": "Not enough credits", "remaining": balance, "required": 3,
+                    "message": "Color by Number costs 3 credits. Upgrade your plan!", "upgrade_url": "https://univers.studio/pricing/"})
         colors = max(4, min(20, colors))
         line_art = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
         async with _gen_semaphore:
@@ -690,13 +702,16 @@ async def generate_mosaic(
             del img
             gc.collect()
 
-    # Consume quota — dual mode
-    if user_id:
-        await credits_module.consume_credits(
-            user_id, 1, "generation", {"mode": mode, "preset": preset}
-        )
-    else:
-        _consume(request, 1)
+    # Consume quota — CBN/AI cost 3 credits, others cost 1
+    # Promo users bypass consumption
+    if not promo:
+        cost = 3 if mode in ("cbn", "pbn") else 1
+        if user_id:
+            await credits_module.consume_credits(
+                user_id, cost, "generation", {"mode": mode, "preset": preset}
+            )
+        else:
+            _consume(request, 1)
 
     # Determine user plan for output tiering
     user_plan = "free"
@@ -717,20 +732,21 @@ async def generate_mosaic(
         return _result_to_zip_stream(name, result, plan=user_plan)
 
     if isinstance(result, CBNResult):
+        # Beauty/preview → watermarked; all other outputs → clean (user paid credits)
+        if output == "beauty":
+            return _img_to_streaming(_add_watermark(result.mystery_full_png), f"{name}-preview.png")
         if output == "mystery":
             if result.mystery_svg:
                 return _svg_to_streaming(result.mystery_svg, f"{name}-mystery.svg")
-            return _img_to_streaming(_add_watermark(result.mystery_png), f"{name}-mystery.png")
+            return _img_to_streaming(result.mystery_png, f"{name}-mystery.png")
         if output == "answer":
             if result.answer_svg:
                 return _svg_to_streaming(result.answer_svg, f"{name}-answer.svg")
-            return _img_to_streaming(_add_watermark(result.answer_png), f"{name}-answer.png")
-        if output == "beauty":
-            return _img_to_streaming(_add_watermark(result.mystery_full_png), f"{name}-preview.png")
+            return _img_to_streaming(result.answer_png, f"{name}-answer.png")
         if output == "legend":
-            return _img_to_streaming(_add_watermark(result.legend_png), f"{name}-legend.png")
+            return _img_to_streaming(result.legend_png, f"{name}-legend.png")
         if output == "full":
-            return _img_to_streaming(_add_watermark(result.mystery_full_png), f"{name}-mystery-full.png")
+            return _img_to_streaming(result.mystery_full_png, f"{name}-mystery-full.png")
         return _result_to_zip_stream(name, result, plan=user_plan)
 
     if output == "mystery":
