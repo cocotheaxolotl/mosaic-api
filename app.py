@@ -1650,30 +1650,34 @@ async def api_admin_stats(secret: str = "", days: int = 30):
         raise HTTPException(403, "Forbidden")
     db = await get_db()
     try:
+        # created_at is stored as Unix timestamp (float)
+        import time as _time
+        cutoff = _time.time() - days * 86400
+
         # Total consumption by mode (last N days)
         rows = await db.execute_fetchall(
             "SELECT json_extract(metadata, '$.mode') as mode, "
             "COUNT(*) as count, SUM(ABS(delta)) as total_credits "
             "FROM credit_transactions "
-            "WHERE delta < 0 AND created_at > datetime('now', ? || ' days') "
+            "WHERE delta < 0 AND created_at > ? "
             "GROUP BY mode ORDER BY total_credits DESC",
-            (f"-{days}",),
+            (cutoff,),
         )
         by_mode = [{"mode": r[0] or "unknown", "count": r[1], "credits": r[2]} for r in rows]
 
         # Daily consumption (last N days)
         daily = await db.execute_fetchall(
-            "SELECT date(created_at) as day, COUNT(*) as count, SUM(ABS(delta)) as credits "
+            "SELECT date(created_at, 'unixepoch') as day, COUNT(*) as count, SUM(ABS(delta)) as credits "
             "FROM credit_transactions "
-            "WHERE delta < 0 AND created_at > datetime('now', ? || ' days') "
+            "WHERE delta < 0 AND created_at > ? "
             "GROUP BY day ORDER BY day DESC",
-            (f"-{days}",),
+            (cutoff,),
         )
         by_day = [{"date": r[0], "count": r[1], "credits": r[2]} for r in daily]
 
         # Recent transactions (last 50)
         recent = await db.execute_fetchall(
-            "SELECT t.created_at, u.email, t.delta, t.reason, t.metadata "
+            "SELECT datetime(t.created_at, 'unixepoch') as ts, u.email, t.delta, t.reason, t.metadata "
             "FROM credit_transactions t LEFT JOIN users u ON u.id = t.user_id "
             "WHERE t.delta < 0 ORDER BY t.created_at DESC LIMIT 50"
         )
