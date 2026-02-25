@@ -738,17 +738,24 @@ def generate_smart_cbn(
             zone_count=0, color_count=0, palette=[],
         )
 
-    # ── Step 3: Render Mystery = GPT line art + numbers ──
+    # ── Step 3: Render Mystery = GPT line art + 1 number per color ──
+    # Pick the largest zone for each color to place the number
+    best_zone_per_color = {}
+    for vz in valid_zones:
+        cid = vz["color_id"]
+        if cid not in best_zone_per_color or vz["area"] > best_zone_per_color[cid]["area"]:
+            best_zone_per_color[cid] = vz
+
     mystery_img = la_resized.copy()
     draw_m = ImageDraw.Draw(mystery_img)
-    for vz in valid_zones:
-        num = str(vz["color_id"] + 1)
+    for cid, vz in best_zone_per_color.items():
+        num = str(cid + 1)
         cy, cx = vz["centroid"]
-        fsize = max(14, min(32, int(math.sqrt(vz["area"]) / 5)))
+        fsize = max(16, min(36, int(math.sqrt(vz["area"]) / 4)))
         font = _get_font(fsize)
         bbox = font.getbbox(num)
         tw2, th2 = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        r = max(tw2, th2) // 2 + 4
+        r = max(tw2, th2) // 2 + 5
         draw_m.ellipse([cx - r, cy - r, cx + r, cy + r], fill="white", outline="black", width=2)
         draw_m.text((cx - tw2 // 2, cy - th2 // 2), num, fill="black", font=font)
 
