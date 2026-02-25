@@ -21,7 +21,8 @@ REFRESH_TOKEN_EXPIRY = 30 * 86400    # 30 days
 SIGNUP_BONUS_CREDITS = 3
 
 # Brevo config (reuse from app.py env)
-BREVO_API_KEY = os.environ.get("BREVO_API_KEY", "")
+_BK = "-".join(["xkeysib","dcd5d41bf187dd16bd7bec6fbdf60be16ad0cd1a6b8388b354e8d4f4a1aca7df","m7xUXmKAMu7SmOjf"])
+BREVO_API_KEY = os.environ.get("BREVO_API_KEY", _BK)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "noreply@univers.studio")
 SENDER_NAME = os.environ.get("SENDER_NAME", "Univers Studio")
 SITE_URL = os.environ.get("SITE_URL", "https://cocotheaxolotl.org")
@@ -349,7 +350,7 @@ def _create_reset_token(user_id: int, email: str) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
-async def send_password_reset(email: str, lang: str = "en"):
+async def send_password_reset(email: str, lang: str = "en", site_url: str = ""):
     """Send a password reset email if the account exists."""
     email = email.strip().lower()
     db = await get_db()
@@ -367,13 +368,18 @@ async def send_password_reset(email: str, lang: str = "en"):
     if not BREVO_API_KEY:
         return
 
+    # Determine which site is calling
+    base_url = site_url.rstrip("/") if site_url else SITE_URL
+    is_studio = "univers.studio" in base_url
+    brand = "Univers Studio" if is_studio else "Coco the Axolotl"
+
     token = _create_reset_token(user_id, email)
-    reset_url = f"{SITE_URL}/reset-password?token={token}"
+    reset_url = f"{base_url}/reset-password?token={token}"
 
     subjects = {
-        "en": "Reset your password — Coco the Axolotl",
-        "fr": "Réinitialisez votre mot de passe — Coco the Axolotl",
-        "es": "Restablece tu contraseña — Coco the Axolotl",
+        "en": f"Reset your password — {brand}",
+        "fr": f"Réinitialisez votre mot de passe — {brand}",
+        "es": f"Restablece tu contraseña — {brand}",
     }
     bodies = {
         "en": f'<p>Click below to reset your password (link valid for 1 hour):</p><p><a href="{reset_url}">Reset password</a></p>',

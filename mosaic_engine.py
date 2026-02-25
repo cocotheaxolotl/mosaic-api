@@ -114,6 +114,46 @@ def _quantize(img: Image.Image, n: int):
     return labels.reshape(img.size[1], img.size[0]), palette
 
 
+def _flatten_background(img: Image.Image, tolerance: int = 60) -> Image.Image:
+    """Detect dominant border color and replace similar pixels with white.
+
+    Samples a 5-pixel band around all four edges, finds the most common color
+    cluster, then replaces all pixels within `tolerance` Euclidean distance
+    of that color with pure white.  Returns a new PIL Image.
+    """
+    arr = np.array(img, dtype=np.float32)
+    h, w = arr.shape[:2]
+    band = 5
+
+    # Collect border pixels (top, bottom, left, right bands)
+    edges = np.concatenate([
+        arr[:band, :].reshape(-1, 3),       # top
+        arr[h - band:, :].reshape(-1, 3),   # bottom
+        arr[:, :band].reshape(-1, 3),       # left
+        arr[:, w - band:].reshape(-1, 3),   # right
+    ])
+
+    # Find dominant border color via small KMeans (3 clusters)
+    from sklearn.cluster import MiniBatchKMeans as _KM
+    n_clusters = min(3, len(edges))
+    km = _KM(n_clusters=n_clusters, random_state=0, n_init=1, batch_size=512)
+    km.fit(edges)
+    counts = np.bincount(km.labels_, minlength=n_clusters)
+    dominant = km.cluster_centers_[counts.argmax()]
+
+    # Skip if border is already close to white (no need to flatten)
+    if np.linalg.norm(dominant - np.array([255, 255, 255])) < 30:
+        return img
+
+    # Replace pixels close to the dominant border color with white
+    dist = np.linalg.norm(arr - dominant, axis=2)
+    mask = dist < tolerance
+    out = arr.copy()
+    out[mask] = [255, 255, 255]
+
+    return Image.fromarray(out.astype(np.uint8), "RGB")
+
+
 def _sample(label_map, cx, cy, cell, w, h):
     r = max(2, int(cell * 0.4))
     ys, ye = max(0, int(cy) - r), min(h, int(cy) + r)
@@ -559,6 +599,9 @@ def generate_cbn(
     if blur > 0:
         img = img.filter(ImageFilter.GaussianBlur(radius=blur))
 
+    # Flatten background: replace dominant border color with white
+    img = _flatten_background(img)
+
     # Fit to page
     if page and page in PAGE_SIZES:
         pw, ph = PAGE_SIZES[page]
@@ -861,6 +904,9 @@ def generate_pbn(
     # Blur (smooths noise → cleaner zones)
     if blur > 0:
         img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+
+    # Flatten background: replace dominant border color with white
+    img = _flatten_background(img)
 
     # Fit to page
     if page and page in PAGE_SIZES:
@@ -1454,50 +1500,72 @@ def _stack(top: Image.Image, bottom: Image.Image, gap: int = 10) -> Image.Image:
 
 # ── ZIP helper (for bulk) ───────────────────────────────────────────────
 
-def images_to_zip(results: list, include_answer: bool = True) -> bytes:
+def images_to_zip(results: list, include_answer: bool = True,
+                   plan: str = "pro") -> bytes:
     """Pack multiple results into a ZIP (in memory).
+
     results = [(name, MosaicResult | CBNResult | PBNResult | LineArtResult), ...]
+
+    Plan-based tiering:
+      - "free" / "creator": mystery-full PNG only (CBN/PBN/Mosaic),
+                            lineart PNG only (LineArt)
+      - "pro" / "studio":  full pack with SVG + all PNGs
     """
+    include_svg = plan in ("pro", "studio")
+    full_pack = plan in ("pro", "studio")
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, res in results:
             if isinstance(res, LineArtResult):
-                # SVG + PNG
-                zf.writestr(f"{name}/{name}-lineart.svg", res.line_art_svg)
+                if include_svg:
+                    zf.writestr(f"{name}/{name}-lineart.svg", res.line_art_svg)
                 img_buf = io.BytesIO()
                 res.line_art_png.save(img_buf, format="PNG", dpi=(300, 300))
                 zf.writestr(f"{name}/{name}-lineart.png", img_buf.getvalue())
             elif isinstance(res, (CBNResult, PBNResult)):
-                # SVG files
-                zf.writestr(f"{name}/{name}-mystery.svg", res.mystery_svg)
-                if include_answer:
-                    zf.writestr(f"{name}/{name}-answer.svg", res.answer_svg)
-                # PNG files
-                for suffix, img in [
-                    ("mystery", res.mystery_png),
-                    ("mystery-full", res.mystery_full_png),
-                    ("legend", res.legend_png),
-                ]:
+                if full_pack:
+                    # SVG files (pro/studio only)
+                    zf.writestr(f"{name}/{name}-mystery.svg", res.mystery_svg)
+                    if include_answer:
+                        zf.writestr(f"{name}/{name}-answer.svg", res.answer_svg)
+                    # All PNG files
+                    for suffix, img in [
+                        ("mystery", res.mystery_png),
+                        ("mystery-full", res.mystery_full_png),
+                        ("legend", res.legend_png),
+                    ]:
+                        img_buf = io.BytesIO()
+                        img.save(img_buf, format="PNG", dpi=(300, 300))
+                        zf.writestr(f"{name}/{name}-{suffix}.png", img_buf.getvalue())
+                    if include_answer:
+                        img_buf = io.BytesIO()
+                        res.answer_png.save(img_buf, format="PNG", dpi=(300, 300))
+                        zf.writestr(f"{name}/{name}-answer.png", img_buf.getvalue())
+                else:
+                    # Free/Creator: mystery-full PNG only
                     img_buf = io.BytesIO()
-                    img.save(img_buf, format="PNG", dpi=(300, 300))
-                    zf.writestr(f"{name}/{name}-{suffix}.png", img_buf.getvalue())
-                if include_answer:
-                    img_buf = io.BytesIO()
-                    res.answer_png.save(img_buf, format="PNG", dpi=(300, 300))
-                    zf.writestr(f"{name}/{name}-answer.png", img_buf.getvalue())
+                    res.mystery_full_png.save(img_buf, format="PNG", dpi=(300, 300))
+                    zf.writestr(f"{name}/{name}-mystery-full.png", img_buf.getvalue())
             else:
                 # MosaicResult (hex/voronoi)
-                items = [
-                    ("mystery", res.mystery),
-                    ("mystery-full", res.mystery_full),
-                    ("beauty", res.beauty),
-                    ("legend", res.legend),
-                ]
-                if include_answer:
-                    items.insert(2, ("answer", res.answer))
-                for suffix, img in items:
+                if full_pack:
+                    items = [
+                        ("mystery", res.mystery),
+                        ("mystery-full", res.mystery_full),
+                        ("beauty", res.beauty),
+                        ("legend", res.legend),
+                    ]
+                    if include_answer:
+                        items.insert(2, ("answer", res.answer))
+                    for suffix, img in items:
+                        img_buf = io.BytesIO()
+                        img.save(img_buf, format="PNG", dpi=(300, 300))
+                        zf.writestr(f"{name}/{name}-{suffix}.png", img_buf.getvalue())
+                else:
+                    # Free/Creator: mystery-full PNG only
                     img_buf = io.BytesIO()
-                    img.save(img_buf, format="PNG", dpi=(300, 300))
-                    zf.writestr(f"{name}/{name}-{suffix}.png", img_buf.getvalue())
+                    res.mystery_full.save(img_buf, format="PNG", dpi=(300, 300))
+                    zf.writestr(f"{name}/{name}-mystery-full.png", img_buf.getvalue())
     buf.seek(0)
     return buf.getvalue()

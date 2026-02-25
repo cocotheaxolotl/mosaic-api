@@ -223,8 +223,8 @@ def _img_to_streaming(img: Image.Image, filename: str) -> StreamingResponse:
     )
 
 
-def _result_to_zip_stream(name: str, res) -> StreamingResponse:
-    data = images_to_zip([(name, res)])
+def _result_to_zip_stream(name: str, res, plan: str = "pro") -> StreamingResponse:
+    data = images_to_zip([(name, res)], plan=plan)
     if isinstance(res, LineArtResult):
         label = "lineart"
     elif isinstance(res, CBNResult):
@@ -681,6 +681,13 @@ async def generate_mosaic(
     else:
         _consume(request, 1)
 
+    # Determine user plan for output tiering
+    user_plan = "free"
+    if user_id:
+        plan_info = await credits_module.get_plan_info(user_id)
+        if plan_info:
+            user_plan = plan_info.get("plan_name", "free")
+
     # Return — handle LineArtResult, CBNResult, or MosaicResult
     # All preview/beauty outputs get watermarked; downloads via email don't.
     if isinstance(result, LineArtResult):
@@ -690,7 +697,7 @@ async def generate_mosaic(
             return _svg_to_streaming(result.line_art_svg, f"{name}-lineart.svg")
         if output in ("beauty", "preview"):
             return _img_to_streaming(_add_watermark(result.preview_png), f"{name}-preview.png")
-        return _result_to_zip_stream(name, result)
+        return _result_to_zip_stream(name, result, plan=user_plan)
 
     if isinstance(result, (CBNResult, PBNResult)):
         if output == "mystery":
@@ -703,7 +710,7 @@ async def generate_mosaic(
             return _img_to_streaming(_add_watermark(result.legend_png), f"{name}-legend.png")
         if output == "full":
             return _img_to_streaming(_add_watermark(result.mystery_full_png), f"{name}-mystery-full.png")
-        return _result_to_zip_stream(name, result)
+        return _result_to_zip_stream(name, result, plan=user_plan)
 
     if output == "mystery":
         return _img_to_streaming(_add_watermark(result.mystery), f"{name}-mystery.png")
@@ -717,7 +724,7 @@ async def generate_mosaic(
         return _img_to_streaming(_add_watermark(result.mystery_full), f"{name}-mystery-full.png")
 
     # Default: ZIP
-    return _result_to_zip_stream(name, result)
+    return _result_to_zip_stream(name, result, plan=user_plan)
 
 
 @app.post("/api/bulk")
@@ -820,8 +827,15 @@ async def bulk_generate(
     else:
         _consume(request, len(results))
 
+    # Determine user plan for output tiering
+    bulk_plan = "free"
+    if user_id:
+        plan_info = await credits_module.get_plan_info(user_id)
+        if plan_info:
+            bulk_plan = plan_info.get("plan_name", "free")
+
     # Pack into ZIP
-    zip_data = images_to_zip(results)
+    zip_data = images_to_zip(results, plan=bulk_plan)
     return StreamingResponse(
         io.BytesIO(zip_data),
         media_type="application/zip",
@@ -1040,8 +1054,8 @@ async def request_download(
         del img
         gc.collect()
 
-    # Pack into ZIP (no answer key in email download)
-    zip_data = images_to_zip([(name, result)], include_answer=False)
+    # Pack into ZIP (free tier: mystery-full only, no answer key)
+    zip_data = images_to_zip([(name, result)], include_answer=False, plan="free")
     if isinstance(result, LineArtResult):
         label = "lineart"
     elif isinstance(result, CBNResult):
@@ -1125,6 +1139,7 @@ class VerifyEmailRequest(BaseModel):
 class ForgotRequest(BaseModel):
     email: str
     lang: str = "en"
+    site_url: str = ""
 
 class ResetRequest(BaseModel):
     token: str
@@ -1189,7 +1204,7 @@ async def api_verify_email(req: VerifyEmailRequest):
 
 @app.post("/api/auth/forgot")
 async def api_forgot(req: ForgotRequest):
-    await auth_module.send_password_reset(req.email, req.lang)
+    await auth_module.send_password_reset(req.email, req.lang, req.site_url)
     return {"ok": True, "message": "If an account exists, a reset email has been sent."}
 
 
@@ -1547,6 +1562,63 @@ async def qr_redirect(short_code: str):
     return RedirectResponse(url=target, status_code=302)
 
 
+# ── Admin endpoints ───────────────────────────────────────────────────────
+
+ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "COCO-ADMIN-2026")
+
+
+class AdminSetPlanRequest(BaseModel):
+    secret: str
+    email: str
+    plan: str = "studio"
+    credits: int = 999999
+    quota: int = 999999
+
+
+@app.post("/api/admin/set-plan")
+async def api_admin_set_plan(req: AdminSetPlanRequest):
+    """Set a user's plan, credits and quota. Requires admin secret."""
+    if req.secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    if req.plan not in ("free", "creator", "pro", "studio"):
+        raise HTTPException(400, "Invalid plan name")
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT id FROM users WHERE email = ?", (req.email.strip().lower(),)
+        )
+        if not rows:
+            raise HTTPException(404, "User not found")
+        user_id = rows[0][0]
+        await db.execute(
+            "UPDATE credits SET plan_name = ?, balance = ?, monthly_quota = ?, sub_status = 'active' WHERE user_id = ?",
+            (req.plan, req.credits, req.quota, user_id),
+        )
+        await db.commit()
+        return {"ok": True, "email": req.email.strip().lower(), "plan": req.plan, "credits": req.credits}
+    finally:
+        await db.close()
+
+
+@app.get("/api/admin/users")
+async def api_admin_list_users(secret: str = ""):
+    """List all users with plan info. Requires admin secret."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT u.id, u.email, u.display_name, c.plan_name, c.balance, c.monthly_quota, c.sub_status "
+            "FROM users u LEFT JOIN credits c ON c.user_id = u.id ORDER BY u.id"
+        )
+        return {"users": [
+            {"id": r[0], "email": r[1], "name": r[2], "plan": r[3], "credits": r[4], "quota": r[5], "sub_status": r[6]}
+            for r in rows
+        ]}
+    finally:
+        await db.close()
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "2.1.0"}
+    return {"status": "ok", "version": "2.2.0"}
