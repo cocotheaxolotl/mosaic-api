@@ -598,33 +598,35 @@ async def generate_mosaic(
       - "preview" → lower-res preview (lineart only)
     """
     # Quota check — dual mode: authenticated (DB credits) or anonymous (IP quota)
+    # Promo codes always bypass quota regardless of auth state
+    promo = _check_promo(promo_code)
     user_id, identifier = await get_user_or_ip(request)
 
-    if user_id:
-        # Authenticated: check DB credits
-        balance = await credits_module.get_balance(user_id)
-        if balance <= 0:
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "error": "Insufficient credits",
-                    "remaining": 0,
-                    "upgrade_url": "https://cocotheaxolotl.org/pricing/",
-                },
-            )
-    else:
-        # Anonymous: legacy IP-based quota
-        promo = _check_promo(promo_code)
-        remaining = _check_quota(request, promo)
-        if remaining <= 0:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "Free limit reached",
-                    "message": f"You've used all {FREE_LIMIT} free generations. Upgrade to Pro for unlimited access!",
-                    "upgrade_url": "https://cocotheaxolotl.org/pricing/",
-                },
-            )
+    if not promo:
+        if user_id:
+            # Authenticated: check DB credits
+            balance = await credits_module.get_balance(user_id)
+            if balance <= 0:
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "error": "Insufficient credits",
+                        "remaining": 0,
+                        "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+                    },
+                )
+        else:
+            # Anonymous: legacy IP-based quota
+            remaining = _check_quota(request, promo)
+            if remaining <= 0:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "Free limit reached",
+                        "message": f"You've used all {FREE_LIMIT} free generations. Upgrade to Pro for unlimited access!",
+                        "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+                    },
+                )
 
     # Validate upload
     if image.content_type not in ALLOWED_TYPES:
@@ -760,34 +762,36 @@ async def bulk_generate(
         raise HTTPException(400, "No images provided")
 
     # Quota check — dual mode
+    # Promo codes always bypass quota regardless of auth state
+    promo = _check_promo(promo_code)
     user_id, identifier = await get_user_or_ip(request)
 
-    if user_id:
-        balance = await credits_module.get_balance(user_id)
-        if balance < n:
-            raise HTTPException(
-                status_code=402,
-                detail={
-                    "error": "Insufficient credits",
-                    "remaining": balance,
-                    "requested": n,
-                    "upgrade_url": "https://cocotheaxolotl.org/pricing/",
-                },
-            )
-    else:
-        promo = _check_promo(promo_code)
-        remaining = _check_quota(request, promo)
-        if remaining < n:
-            raise HTTPException(
-                status_code=429,
-                detail={
-                    "error": "Not enough free credits",
-                    "remaining": remaining,
-                    "requested": n,
-                    "message": f"You have {remaining} free generation(s) left but requested {n}. Upgrade to Pro!",
-                    "upgrade_url": "https://cocotheaxolotl.org/mosaic/pricing/",
-                },
-            )
+    if not promo:
+        if user_id:
+            balance = await credits_module.get_balance(user_id)
+            if balance < n:
+                raise HTTPException(
+                    status_code=402,
+                    detail={
+                        "error": "Insufficient credits",
+                        "remaining": balance,
+                        "requested": n,
+                        "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+                    },
+                )
+        else:
+            remaining = _check_quota(request, promo)
+            if remaining < n:
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "error": "Not enough free credits",
+                        "remaining": remaining,
+                        "requested": n,
+                        "message": f"You have {remaining} free generation(s) left but requested {n}. Upgrade to Pro!",
+                        "upgrade_url": "https://cocotheaxolotl.org/mosaic/pricing/",
+                    },
+                )
 
     # Process all images (semaphore: only 1 generation at a time)
     results = []
