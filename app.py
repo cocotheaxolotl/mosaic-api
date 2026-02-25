@@ -319,11 +319,12 @@ import httpx
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 
-async def _ai_coloring_page(image_data: bytes, hint: str = "") -> Image.Image:
+async def _ai_coloring_page(image_data: bytes, hint: str = "", style: str = "kids") -> Image.Image:
     """Generate a coloring page using OpenAI gpt-image-1 edits endpoint.
 
     Sends the actual photo directly to the model so it can see the exact pose,
     framing, and composition — much better than describe-then-generate.
+    style: "kids" (simple thick outlines) or "zen" (intricate mandala patterns)
     """
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OpenAI API key not configured")
@@ -339,16 +340,26 @@ async def _ai_coloring_page(image_data: bytes, hint: str = "") -> Image.Image:
     if hint:
         hint_text = f" The subject is: {hint}."
 
-    prompt = (
-        f"Transform this image into a clean black-and-white coloring page.{hint_text} "
-        f"CRITICAL: Use ONLY pure black (#000000) lines on a pure white (#FFFFFF) background. "
-        f"Absolutely NO gray, NO shading, NO gradients, NO hatching, NO texture fills. "
-        f"Every area must be either pure black (outlines) or pure white (fill zones). "
-        f"Keep the EXACT same pose, framing, and composition as the original. "
-        f"Bold clean thick outlines, large clear zones that children can color with crayons."
-    )
+    if style == "zen":
+        prompt = (
+            f"Transform this image into a beautiful adult coloring page with intricate mandala-style patterns.{hint_text} "
+            f"Keep the EXACT same pose, framing, and composition as the original image. "
+            f"Fill every surface with detailed decorative patterns: mandalas, zentangle, paisleys, geometric motifs. "
+            f"Pure black lines on pure white background. No gray, no shading, no filled areas. "
+            f"Professional quality, clean crisp lines, every zone is a distinct enclosed area to color. "
+            f"Dense intricate details suitable for adult relaxation coloring books."
+        )
+    else:
+        prompt = (
+            f"Transform this image into a clean coloring page for children.{hint_text} "
+            f"Keep the EXACT same pose, framing, and composition as the original image. "
+            f"Pure black outlines on pure white background. No gray, no shading, no gradients. "
+            f"Bold thick clean outlines. Large clear enclosed zones that children can color with crayons. "
+            f"Simple shapes, not too much detail. Cute friendly cartoon style. "
+            f"Professional coloring book quality, every area clearly enclosed by black lines."
+        )
 
-    async with httpx.AsyncClient(timeout=120) as client:
+    async with httpx.AsyncClient(timeout=180) as client:
         img_resp = await client.post(
             "https://api.openai.com/v1/images/edits",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
@@ -358,7 +369,7 @@ async def _ai_coloring_page(image_data: bytes, hint: str = "") -> Image.Image:
                 "prompt": prompt,
                 "n": "1",
                 "size": "1024x1024",
-                "quality": "medium",
+                "quality": "high",
             },
         )
         if img_resp.status_code != 200:
@@ -581,6 +592,7 @@ async def generate_mosaic(
     detail: str = Form("standard"),   # lineart detail: simple/standard/detailed/expert
     thickness: int = Form(2),         # lineart line thickness: 1-4
     hint: str = Form(""),             # optional user hint for AI mode (e.g. "an impala")
+    cbn_style: str = Form("kids"),   # CBN/coloring style: "kids" (simple) or "zen" (mandala)
     promo_code: Optional[str] = Form(None),
 ):
     """Generate a mystery mosaic or coloring page from a single uploaded image.
@@ -641,7 +653,7 @@ async def generate_mosaic(
 
     # AI coloring page mode — calls OpenAI, returns immediately
     if mode == "ai":
-        ai_img = await _ai_coloring_page(data, hint=hint.strip())
+        ai_img = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
         if user_id:
             await credits_module.consume_credits(user_id, 1, "generation", {"mode": "ai"})
         else:
@@ -651,7 +663,7 @@ async def generate_mosaic(
     # Smart CBN: GPT line art + original colors (AI call outside semaphore)
     if mode in ("cbn", "pbn"):
         colors = max(4, min(20, colors))
-        line_art = await _ai_coloring_page(data, hint=hint.strip())
+        line_art = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
         async with _gen_semaphore:
             result = generate_smart_cbn(img, line_art, colors=colors, page=page)
             del img, line_art
