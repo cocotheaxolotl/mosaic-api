@@ -443,11 +443,6 @@ PRESETS = {
     "lineart-standard": Preset("lineart-standard", "Line Art Standard",           "letter", 0, 0, mode="lineart", lineart_detail="standard", lineart_thickness=2),
     "lineart-detailed": Preset("lineart-detailed", "Line Art Detailed",           "letter", 0, 0, mode="lineart", lineart_detail="detailed", lineart_thickness=2),
     "lineart-expert":   Preset("lineart-expert",   "Line Art Expert",             "letter", 0, 0, mode="lineart", lineart_detail="expert",   lineart_thickness=1),
-    # Paint by Number presets (Potrace Bezier curves)
-    "pbn-kids":     Preset("pbn-kids",     "PBN Kids (easy)",    "letter", 0, 6,  blur=3, mode="pbn", min_zone_pixels=1200),
-    "pbn-standard": Preset("pbn-standard", "PBN Standard",       "letter", 0, 12, blur=2, mode="pbn", min_zone_pixels=500),
-    "pbn-detailed": Preset("pbn-detailed", "PBN Detailed",       "letter", 0, 20, blur=1, mode="pbn", min_zone_pixels=300),
-    "pbn-a4":       Preset("pbn-a4",       "PBN A4 Print-ready", "a4",     0, 12, blur=2, mode="pbn", min_zone_pixels=500),
 }
 
 
@@ -1598,10 +1593,6 @@ def generate_from_preset(img: Image.Image, preset_name: str):
                             landscape=p.landscape, crop=p.crop, blur=p.blur,
                             min_zone_pixels=p.min_zone_pixels,
                             epsilon_factor=p.epsilon_factor)
-    if p.mode == "pbn":
-        return generate_pbn(img, colors=p.colors, page=p.page,
-                            landscape=p.landscape, crop=p.crop, blur=p.blur,
-                            min_zone_pixels=p.min_zone_pixels)
     if p.mode == "voronoi":
         density_map = VORONOI_DENSITIES.get(p.page, VORONOI_DENSITIES["letter"])
         density = density_map.get(p.voronoi_density, 500)

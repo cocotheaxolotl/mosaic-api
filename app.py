@@ -53,9 +53,9 @@ import stripe_integration
 import api_keys as api_keys_module
 
 from mosaic_engine import (
-    generate, generate_voronoi, generate_cbn, generate_line_art, generate_pbn,
+    generate, generate_voronoi, generate_cbn, generate_line_art,
     generate_smart_cbn, generate_from_preset, images_to_zip,
-    PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, PBNResult, LineArtResult,
+    PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, LineArtResult,
 )
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -229,8 +229,6 @@ def _result_to_zip_stream(name: str, res, plan: str = "pro") -> StreamingRespons
         label = "lineart"
     elif isinstance(res, CBNResult):
         label = "cbn"
-    elif isinstance(res, PBNResult):
-        label = "pbn"
     else:
         label = "mosaic"
     return StreamingResponse(
@@ -704,7 +702,7 @@ async def generate_mosaic(
             return _img_to_streaming(_add_watermark(result.preview_png), f"{name}-preview.png")
         return _result_to_zip_stream(name, result, plan=user_plan)
 
-    if isinstance(result, (CBNResult, PBNResult)):
+    if isinstance(result, CBNResult):
         if output == "mystery":
             if result.mystery_svg:
                 return _svg_to_streaming(result.mystery_svg, f"{name}-mystery.svg")
@@ -813,8 +811,6 @@ async def bulk_generate(
                                         line_thickness=max(1, min(4, thickness)))
             elif mode == "cbn":
                 res = generate_cbn(img, colors=max(4, min(20, colors)), page=page, blur=2)
-            elif mode == "pbn":
-                res = generate_pbn(img, colors=max(4, min(30, colors)), page=page, blur=2)
             elif mode == "voronoi":
                 density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
                 num_cells = density_map.get(density, density_map["standard"])
@@ -905,7 +901,6 @@ def _send_brevo_email(to_email: str, download_url: str, mode: str = "hex"):
         "ai": ("Your AI Coloring Page is ready!", "coloring page", "Download My Coloring Page"),
         "lineart": ("Your Coloring Page is ready!", "coloring page", "Download My Coloring Page"),
         "cbn": ("Your Color by Number is ready!", "color by number", "Download My Color by Number"),
-        "pbn": ("Your Paint by Number is ready!", "paint by number", "Download My Paint by Number"),
     }
     subject, label, btn_text = _MODE_LABELS.get(mode, ("Your Mystery Mosaic is ready!", "mosaic", "Download My Mosaic"))
 
@@ -1050,9 +1045,6 @@ async def request_download(
         elif mode == "cbn":
             colors = max(4, min(20, colors))
             result = generate_cbn(img, colors=colors, page=page, blur=2)
-        elif mode == "pbn":
-            colors = max(4, min(30, colors))
-            result = generate_pbn(img, colors=colors, page=page, blur=2)
         elif mode == "voronoi":
             colors = max(4, min(20, colors))
             density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
@@ -1071,8 +1063,6 @@ async def request_download(
         label = "lineart"
     elif isinstance(result, CBNResult):
         label = "cbn"
-    elif isinstance(result, PBNResult):
-        label = "pbn"
     else:
         label = "mosaic"
     filename = f"{name}-{label}.zip"
