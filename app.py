@@ -644,7 +644,10 @@ async def generate_mosaic(
         ai_img = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
         if not promo and user_id:
             await credits_module.consume_credits(user_id, 3, "generation", {"mode": "ai", "style": cbn_style})
-        return _img_to_streaming(_add_watermark(ai_img), f"{name}-coloring.png")
+        # Watermark only for anonymous free users
+        if not user_id and not promo:
+            ai_img = _add_watermark(ai_img)
+        return _img_to_streaming(ai_img, f"{name}-coloring.png")
 
     # Smart CBN: GPT line art + original colors (3 credits, account required)
     if mode in ("cbn", "pbn"):
@@ -702,20 +705,24 @@ async def generate_mosaic(
             user_plan = plan_info.get("plan_name", "free")
 
     # Return — handle LineArtResult, CBNResult, or MosaicResult
-    # All preview/beauty outputs get watermarked; downloads via email don't.
+    # Watermark only for anonymous free users (no account, no promo)
+    _wm = not user_id and not promo  # True = add watermark
+
     if isinstance(result, LineArtResult):
         if output in ("mystery", "png"):
-            return _img_to_streaming(_add_watermark(result.line_art_png), f"{name}-lineart.png")
+            img_out = _add_watermark(result.line_art_png) if _wm else result.line_art_png
+            return _img_to_streaming(img_out, f"{name}-lineart.png")
         if output in ("svg", "answer"):
             return _svg_to_streaming(result.line_art_svg, f"{name}-lineart.svg")
         if output in ("beauty", "preview"):
-            return _img_to_streaming(_add_watermark(result.preview_png), f"{name}-preview.png")
+            img_out = _add_watermark(result.preview_png) if _wm else result.preview_png
+            return _img_to_streaming(img_out, f"{name}-preview.png")
         return _result_to_zip_stream(name, result, plan=user_plan)
 
     if isinstance(result, CBNResult):
-        # Beauty/preview → watermarked; all other outputs → clean (user paid credits)
         if output == "beauty":
-            return _img_to_streaming(_add_watermark(result.mystery_full_png), f"{name}-preview.png")
+            img_out = _add_watermark(result.mystery_full_png) if _wm else result.mystery_full_png
+            return _img_to_streaming(img_out, f"{name}-preview.png")
         if output == "mystery":
             if result.mystery_svg:
                 return _svg_to_streaming(result.mystery_svg, f"{name}-mystery.svg")
@@ -731,15 +738,20 @@ async def generate_mosaic(
         return _result_to_zip_stream(name, result, plan=user_plan)
 
     if output == "mystery":
-        return _img_to_streaming(_add_watermark(result.mystery), f"{name}-mystery.png")
+        img_out = _add_watermark(result.mystery) if _wm else result.mystery
+        return _img_to_streaming(img_out, f"{name}-mystery.png")
     if output == "answer":
-        return _img_to_streaming(_add_watermark(result.answer), f"{name}-answer.png")
+        img_out = _add_watermark(result.answer) if _wm else result.answer
+        return _img_to_streaming(img_out, f"{name}-answer.png")
     if output == "beauty":
-        return _img_to_streaming(_add_watermark(result.beauty), f"{name}-beauty.png")
+        img_out = _add_watermark(result.beauty) if _wm else result.beauty
+        return _img_to_streaming(img_out, f"{name}-beauty.png")
     if output == "legend":
-        return _img_to_streaming(_add_watermark(result.legend), f"{name}-legend.png")
+        img_out = _add_watermark(result.legend) if _wm else result.legend
+        return _img_to_streaming(img_out, f"{name}-legend.png")
     if output == "full":
-        return _img_to_streaming(_add_watermark(result.mystery_full), f"{name}-mystery-full.png")
+        img_out = _add_watermark(result.mystery_full) if _wm else result.mystery_full
+        return _img_to_streaming(img_out, f"{name}-mystery-full.png")
 
     # Default: ZIP
     return _result_to_zip_stream(name, result, plan=user_plan)
