@@ -336,17 +336,9 @@ async def _ai_coloring_page(image_data: bytes, hint: str = "", style: str = "kid
     png_bytes = png_buf.getvalue()
 
     if style == "zen":
-        prompt = (
-            "Transform into a coloring page for adults. "
-            "Black outlines on white background. No decoration, no ornaments. "
-            "No gray, no shading, no filled areas. Clean lines only."
-        )
+        prompt = "Make the coloring page without decoration, for adults."
     else:
-        prompt = (
-            "Transform into a coloring page for children. "
-            "Black outlines on white background. No decoration, no ornaments. "
-            "No gray, no shading. Simple bold outlines, large zones."
-        )
+        prompt = "Make the coloring page without decoration."
 
     async with httpx.AsyncClient(timeout=180) as client:
         img_resp = await client.post(
