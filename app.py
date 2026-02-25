@@ -340,10 +340,12 @@ async def _ai_coloring_page(image_data: bytes, hint: str = "") -> Image.Image:
         hint_text = f" The subject is: {hint}."
 
     prompt = (
-        f"Transform this photo into a simple black and white coloring page for children.{hint_text} "
-        f"Keep the EXACT same pose, framing, and composition as the original photo. "
-        f"Bold clean outlines, no shading, no gray tones, no colors, pure white background. "
-        f"Style: cute cartoon illustration with clear thick outlines, suitable for kids to color with crayons."
+        f"Transform this image into a clean black-and-white coloring page.{hint_text} "
+        f"CRITICAL: Use ONLY pure black (#000000) lines on a pure white (#FFFFFF) background. "
+        f"Absolutely NO gray, NO shading, NO gradients, NO hatching, NO texture fills. "
+        f"Every area must be either pure black (outlines) or pure white (fill zones). "
+        f"Keep the EXACT same pose, framing, and composition as the original. "
+        f"Bold clean thick outlines, large clear zones that children can color with crayons."
     )
 
     async with httpx.AsyncClient(timeout=120) as client:

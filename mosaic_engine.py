@@ -655,19 +655,21 @@ def generate_smart_cbn(
     line_art: Image.Image,
     colors: int = 10,
     page: str = "letter",
-    min_zone_pixels: int = 200,
+    min_zone_pixels: int = 80,
 ) -> CBNResult:
     """Smart Color-by-Number: use GPT-generated line art + original photo colors.
 
     Pipeline:
       1. Resize both images to page dimensions
-      2. Threshold line art to binary (black lines / white zones)
-      3. Connected components on white areas → zone map
-      4. For each zone, sample original image → average color
-      5. Cluster zone colors into N groups (KMeans)
-      6. Render: line art + numbers overlaid + color legend
+      2. Threshold line art to binary (Otsu or 128 — clean black/white)
+      3. Morphological close to fill small gaps
+      4. Connected components on white areas → zone map
+      5. For each zone, sample original image → median color at centroid region
+      6. Cluster zone colors into N groups (KMeans)
+      7. Render: line art + numbers overlaid + color legend
     """
     from scipy import ndimage
+    from scipy.ndimage import binary_closing
 
     # Determine target size from page
     if page and page in PAGE_SIZES:
@@ -682,21 +684,44 @@ def generate_smart_cbn(
     s = min(tw / la_gray.size[0], th / la_gray.size[1])
     new_w, new_h = int(la_gray.size[0] * s), int(la_gray.size[1] * s)
     la_gray = la_gray.resize((new_w, new_h), Image.LANCZOS)
-    la_rgb = line_art.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
 
     # Resize original to same dimensions
     orig = original.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
     orig_arr = np.array(orig, dtype=np.float32)
 
-    # Threshold: white zones (>=160) → 1, black lines (<160) → 0
+    # ── Create clean black/white line art ──
     la_arr = np.array(la_gray)
-    binary = (la_arr >= 160).astype(np.uint8)
+    # Simple Otsu threshold (no scikit-image dependency)
+    hist, _ = np.histogram(la_arr.ravel(), bins=256, range=(0, 256))
+    total = la_arr.size
+    sum_all = np.dot(np.arange(256), hist)
+    w0, sum0, best_thresh, best_var = 0, 0.0, 128, 0.0
+    for t in range(256):
+        w0 += hist[t]
+        if w0 == 0 or w0 == total:
+            continue
+        sum0 += t * hist[t]
+        m0 = sum0 / w0
+        m1 = (sum_all - sum0) / (total - w0)
+        var = w0 * (total - w0) * (m0 - m1) ** 2
+        if var > best_var:
+            best_var = var
+            best_thresh = t
+    thresh = max(100, min(200, best_thresh))
+    binary = (la_arr >= thresh).astype(np.uint8)
+
+    # Morphological closing: fill small gaps in zones (3x3 kernel)
+    binary = binary_closing(binary, structure=np.ones((3, 3)), iterations=1).astype(np.uint8)
+
+    # Create clean black-and-white line art for rendering (no gray)
+    la_clean = np.where(la_arr >= thresh, 255, 0).astype(np.uint8)
+    la_rgb = Image.fromarray(np.stack([la_clean, la_clean, la_clean], axis=-1))
 
     # Connected components on white zones
     labeled, n_features = ndimage.label(binary)
     slices = ndimage.find_objects(labeled)
 
-    # For each zone, compute average color from original
+    # For each zone, compute color from original (median in centroid region)
     valid_zones = []
     for rid, sl in enumerate(slices, start=1):
         if sl is None:
@@ -707,18 +732,24 @@ def generate_smart_cbn(
         if area < min_zone_pixels:
             continue
 
-        # Average color from original image
-        orig_crop = orig_arr[sl]
-        zone_rgb = orig_crop[mask].mean(axis=0)
-
-        # Skip near-white zones (background)
-        if np.linalg.norm(zone_rgb - np.array([255, 255, 255])) < 25:
-            continue
-
         # Centroid
         ys, xs = np.where(mask)
         cy = int(ys.mean()) + sl[0].start
         cx = int(xs.mean()) + sl[1].start
+
+        # Sample color: median of a small region around centroid in original
+        r_sample = max(3, int(math.sqrt(area) / 4))
+        y0, y1 = max(0, cy - r_sample), min(new_h, cy + r_sample + 1)
+        x0, x1 = max(0, cx - r_sample), min(new_w, cx + r_sample + 1)
+        sample_patch = orig_arr[y0:y1, x0:x1]
+        # Use only pixels that belong to this zone within the patch
+        patch_labeled = labeled[y0:y1, x0:x1]
+        patch_mask = (patch_labeled == rid)
+        if patch_mask.any():
+            zone_rgb = np.median(sample_patch[patch_mask], axis=0)
+        else:
+            # Fallback: average of entire zone
+            zone_rgb = orig_arr[sl][mask].mean(axis=0)
 
         valid_zones.append({
             "label": rid,
@@ -745,7 +776,7 @@ def generate_smart_cbn(
     color_labels = km.fit_predict(all_colors)
     palette = km.cluster_centers_.astype(np.uint8)
 
-    # ── Render Mystery PNG: line art + numbers overlaid ──
+    # ── Render Mystery PNG: clean line art + numbers overlaid ──
     mystery_img = la_rgb.copy()
     draw_m = ImageDraw.Draw(mystery_img)
     for i, vz in enumerate(valid_zones):
@@ -761,7 +792,7 @@ def generate_smart_cbn(
         draw_m.ellipse([cx - r, cy - r, cx + r, cy + r], fill="white", outline="black", width=1)
         draw_m.text((cx - tw2 // 2, cy - th2 // 2), num, fill="black", font=font)
 
-    # ── Render Answer PNG: colored fills + line art overlay ──
+    # ── Render Answer PNG: colored fills + clean line overlay ──
     answer_arr = np.full((new_h, new_w, 3), 255, dtype=np.uint8)
     for i, vz in enumerate(valid_zones):
         sl = vz["slice"]
@@ -770,10 +801,9 @@ def generate_smart_cbn(
         color = tuple(int(c) for c in palette[color_labels[i]])
         answer_arr[sl][mask] = color
 
-    # Overlay black lines from line art
-    dark_mask = la_arr < 160
-    la_rgb_arr = np.array(la_rgb)
-    answer_arr[dark_mask] = la_rgb_arr[dark_mask]
+    # Overlay ONLY the black lines (clean threshold, not gray shading)
+    line_mask = la_clean < 128
+    answer_arr[line_mask] = 0  # Pure black lines
     answer_img = Image.fromarray(answer_arr)
 
     del labeled, answer_arr
