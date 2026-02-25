@@ -320,11 +320,13 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
 
 async def _ai_coloring_page(image_data: bytes, hint: str = "", style: str = "kids") -> Image.Image:
-    """Generate a coloring page using OpenAI gpt-image-1 edits endpoint.
+    """Generate a coloring page using a 2-step pipeline (like ChatGPT):
 
-    Sends the actual photo directly to the model so it can see the exact pose,
-    framing, and composition — much better than describe-then-generate.
-    style: "kids" (simple thick outlines) or "zen" (intricate mandala patterns)
+    Step 1: GPT-4o vision analyzes the photo and writes a detailed description
+    Step 2: gpt-image-1 edits the photo into a coloring page using that description
+
+    This produces much better results than a generic prompt because the
+    description captures the exact subject, pose, details, and composition.
     """
     if not OPENAI_API_KEY:
         raise HTTPException(500, "OpenAI API key not configured")
@@ -336,30 +338,74 @@ async def _ai_coloring_page(image_data: bytes, hint: str = "", style: str = "kid
     img_input.save(png_buf, format="PNG")
     png_bytes = png_buf.getvalue()
 
-    hint_text = ""
-    if hint:
-        hint_text = f" The subject is: {hint}."
+    # --- Step 1: GPT-4o vision describes the image ---
+    img_b64_input = base64.b64encode(png_bytes).decode()
 
-    if style == "zen":
-        prompt = (
-            f"Transform this image into a beautiful adult coloring page with intricate mandala-style patterns.{hint_text} "
-            f"Keep the EXACT same pose, framing, and composition as the original image. "
-            f"Fill every surface with detailed decorative patterns: mandalas, zentangle, paisleys, geometric motifs. "
-            f"Pure black lines on pure white background. No gray, no shading, no filled areas. "
-            f"Professional quality, clean crisp lines, every zone is a distinct enclosed area to color. "
-            f"Dense intricate details suitable for adult relaxation coloring books."
-        )
-    else:
-        prompt = (
-            f"Transform this image into a clean coloring page for children.{hint_text} "
-            f"Keep the EXACT same pose, framing, and composition as the original image. "
-            f"Pure black outlines on pure white background. No gray, no shading, no gradients. "
-            f"Bold thick clean outlines. Large clear enclosed zones that children can color with crayons. "
-            f"Simple shapes, not too much detail. Cute friendly cartoon style. "
-            f"Professional coloring book quality, every area clearly enclosed by black lines."
-        )
+    vision_prompt = (
+        "Describe this image in detail for an illustrator who will draw it as a coloring page. "
+        "Include: the main subject, its exact pose/position, facial expression, "
+        "all visible objects, background elements, and overall composition. "
+        "Be very specific and visual. 2-3 sentences max. Do NOT mention colors."
+    )
+    if hint:
+        vision_prompt += f" The subject is: {hint}."
 
     async with httpx.AsyncClient(timeout=180) as client:
+        # GPT-4o vision analysis
+        vision_resp = await client.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o",
+                "max_tokens": 200,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": vision_prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{img_b64_input}",
+                                    "detail": "low",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+        if vision_resp.status_code != 200:
+            # Fallback: use hint or generic description
+            description = hint or "the subject in the image"
+        else:
+            description = vision_resp.json()["choices"][0]["message"]["content"].strip()
+
+        # --- Step 2: gpt-image-1 generates coloring page with detailed prompt ---
+        if style == "zen":
+            prompt = (
+                f"Transform this image into a beautiful adult coloring page. "
+                f"The image shows: {description}. "
+                f"Keep the EXACT same pose, framing, and composition. "
+                f"Fill every surface with intricate decorative patterns: mandalas, zentangle, paisleys, geometric motifs. "
+                f"Pure black lines on pure white background. No gray, no shading, no filled areas. "
+                f"Professional quality, clean crisp lines, every zone is a distinct enclosed area to color. "
+                f"Dense intricate details suitable for adult relaxation coloring books."
+            )
+        else:
+            prompt = (
+                f"Transform this image into a clean coloring page for children. "
+                f"The image shows: {description}. "
+                f"Keep the EXACT same pose, framing, and composition. "
+                f"Pure black outlines on pure white background. No gray, no shading, no gradients. "
+                f"Bold thick clean outlines. Large clear enclosed zones that children can color with crayons. "
+                f"Simple shapes, not too much detail. Cute friendly cartoon style. "
+                f"Professional coloring book quality, every area clearly enclosed by black lines."
+            )
+
         img_resp = await client.post(
             "https://api.openai.com/v1/images/edits",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
