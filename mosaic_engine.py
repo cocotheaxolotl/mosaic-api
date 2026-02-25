@@ -653,6 +653,156 @@ def generate_cbn(
     )
 
 
+# ── Smart Color by Number (GPT line art + original colors) ─────────────
+
+def generate_smart_cbn(
+    original: Image.Image,
+    line_art: Image.Image,
+    colors: int = 10,
+    page: str = "letter",
+    min_zone_pixels: int = 200,
+) -> CBNResult:
+    """Smart Color-by-Number: use GPT-generated line art + original photo colors.
+
+    Pipeline:
+      1. Resize both images to page dimensions
+      2. Threshold line art to binary (black lines / white zones)
+      3. Connected components on white areas → zone map
+      4. For each zone, sample original image → average color
+      5. Cluster zone colors into N groups (KMeans)
+      6. Render: line art + numbers overlaid + color legend
+    """
+    from scipy import ndimage
+
+    # Determine target size from page
+    if page and page in PAGE_SIZES:
+        pw, ph = PAGE_SIZES[page]
+        margin = 50
+        tw, th = pw - 2 * margin, ph - 2 * margin
+    else:
+        tw, th = 2400, 3000
+
+    # Resize line art to fit page
+    la_gray = line_art.convert("L")
+    s = min(tw / la_gray.size[0], th / la_gray.size[1])
+    new_w, new_h = int(la_gray.size[0] * s), int(la_gray.size[1] * s)
+    la_gray = la_gray.resize((new_w, new_h), Image.LANCZOS)
+    la_rgb = line_art.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
+
+    # Resize original to same dimensions
+    orig = original.convert("RGB").resize((new_w, new_h), Image.LANCZOS)
+    orig_arr = np.array(orig, dtype=np.float32)
+
+    # Threshold: white zones (>=160) → 1, black lines (<160) → 0
+    la_arr = np.array(la_gray)
+    binary = (la_arr >= 160).astype(np.uint8)
+
+    # Connected components on white zones
+    labeled, n_features = ndimage.label(binary)
+    slices = ndimage.find_objects(labeled)
+
+    # For each zone, compute average color from original
+    valid_zones = []
+    for rid, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+        crop = labeled[sl]
+        mask = (crop == rid)
+        area = int(mask.sum())
+        if area < min_zone_pixels:
+            continue
+
+        # Average color from original image
+        orig_crop = orig_arr[sl]
+        zone_rgb = orig_crop[mask].mean(axis=0)
+
+        # Skip near-white zones (background)
+        if np.linalg.norm(zone_rgb - np.array([255, 255, 255])) < 25:
+            continue
+
+        # Centroid
+        ys, xs = np.where(mask)
+        cy = int(ys.mean()) + sl[0].start
+        cx = int(xs.mean()) + sl[1].start
+
+        valid_zones.append({
+            "label": rid,
+            "avg_color": zone_rgb,
+            "area": area,
+            "centroid": (cy, cx),
+            "slice": sl,
+        })
+
+    if not valid_zones:
+        # Fallback: return the line art as-is if no zones detected
+        legend_png = Image.new("RGB", (new_w, 60), (255, 255, 255))
+        full = _stack(la_rgb, legend_png)
+        return CBNResult(
+            mystery_svg="", mystery_png=la_rgb, answer_svg="", answer_png=la_rgb,
+            legend_png=legend_png, mystery_full_png=full,
+            zone_count=0, color_count=0, palette=[],
+        )
+
+    # Cluster zone colors into `colors` groups
+    all_colors = np.array([z["avg_color"] for z in valid_zones])
+    n_clusters = min(colors, len(valid_zones))
+    km = MiniBatchKMeans(n_clusters=n_clusters, random_state=0, n_init=3, batch_size=256)
+    color_labels = km.fit_predict(all_colors)
+    palette = km.cluster_centers_.astype(np.uint8)
+
+    # ── Render Mystery PNG: line art + numbers overlaid ──
+    mystery_img = la_rgb.copy()
+    draw_m = ImageDraw.Draw(mystery_img)
+    for i, vz in enumerate(valid_zones):
+        num = str(int(color_labels[i]) + 1)
+        cy, cx = vz["centroid"]
+        # Font size proportional to zone area
+        fsize = max(10, min(24, int(math.sqrt(vz["area"]) / 6)))
+        font = _get_font(fsize)
+        bbox = font.getbbox(num)
+        tw2, th2 = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        # White circle behind number for readability
+        r = max(tw2, th2) // 2 + 3
+        draw_m.ellipse([cx - r, cy - r, cx + r, cy + r], fill="white", outline="black", width=1)
+        draw_m.text((cx - tw2 // 2, cy - th2 // 2), num, fill="black", font=font)
+
+    # ── Render Answer PNG: colored fills + line art overlay ──
+    answer_arr = np.full((new_h, new_w, 3), 255, dtype=np.uint8)
+    for i, vz in enumerate(valid_zones):
+        sl = vz["slice"]
+        crop = labeled[sl]
+        mask = (crop == vz["label"])
+        color = tuple(int(c) for c in palette[color_labels[i]])
+        answer_arr[sl][mask] = color
+
+    # Overlay black lines from line art
+    dark_mask = la_arr < 160
+    la_rgb_arr = np.array(la_rgb)
+    answer_arr[dark_mask] = la_rgb_arr[dark_mask]
+    answer_img = Image.fromarray(answer_arr)
+
+    del labeled, answer_arr
+
+    # ── Legend + combined ──
+    legend_png = _make_legend(palette, new_w)
+    mystery_full_png = _stack(mystery_img, legend_png)
+
+    pal_list = [tuple(int(c) for c in row) for row in palette]
+
+    gc.collect()
+    return CBNResult(
+        mystery_svg="",               # No SVG in smart mode (line art is raster)
+        mystery_png=mystery_img,
+        answer_svg="",
+        answer_png=answer_img,
+        legend_png=legend_png,
+        mystery_full_png=mystery_full_png,
+        zone_count=len(valid_zones),
+        color_count=n_clusters,
+        palette=pal_list,
+    )
+
+
 # ── Paint by Number helpers (Potrace) ──────────────────────────────────
 
 def _pbn_trace_zone(

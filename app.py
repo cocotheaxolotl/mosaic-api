@@ -54,7 +54,7 @@ import api_keys as api_keys_module
 
 from mosaic_engine import (
     generate, generate_voronoi, generate_cbn, generate_line_art, generate_pbn,
-    generate_from_preset, images_to_zip,
+    generate_smart_cbn, generate_from_preset, images_to_zip,
     PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, PBNResult, LineArtResult,
 )
 
@@ -646,32 +646,35 @@ async def generate_mosaic(
             _consume(request, 1)
         return _img_to_streaming(_add_watermark(ai_img), f"{name}-coloring.png")
 
-    # Generate (semaphore: only 1 at a time to prevent OOM)
-    async with _gen_semaphore:
-        if preset and preset in PRESETS:
-            result = generate_from_preset(img, preset)
-        elif mode == "lineart":
-            detail_level = detail if detail in ("simple", "standard", "detailed", "expert") else "standard"
-            thickness_clamped = max(1, min(4, thickness))
-            result = generate_line_art(img, page=page, detail_level=detail_level,
-                                       line_thickness=thickness_clamped)
-        elif mode == "cbn":
-            colors = max(4, min(20, colors))
-            result = generate_cbn(img, colors=colors, page=page, blur=2)
-        elif mode == "pbn":
-            colors = max(4, min(30, colors))
-            result = generate_pbn(img, colors=colors, page=page, blur=2)
-        elif mode == "voronoi":
-            colors = max(4, min(20, colors))
-            density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
-            num_cells = density_map.get(density, density_map["standard"])
-            result = generate_voronoi(img, colors=colors, density=num_cells, page=page)
-        else:
-            colors = max(4, min(20, colors))
-            cell_size = max(12, min(50, cell_size))
-            result = generate(img, colors=colors, cell_size=cell_size, page=page)
-        del img
-        gc.collect()
+    # Smart CBN: GPT line art + original colors (AI call outside semaphore)
+    if mode in ("cbn", "pbn"):
+        colors = max(4, min(20, colors))
+        line_art = await _ai_coloring_page(data, hint=hint.strip())
+        async with _gen_semaphore:
+            result = generate_smart_cbn(img, line_art, colors=colors, page=page)
+            del img, line_art
+            gc.collect()
+    else:
+        # Generate (semaphore: only 1 at a time to prevent OOM)
+        async with _gen_semaphore:
+            if preset and preset in PRESETS:
+                result = generate_from_preset(img, preset)
+            elif mode == "lineart":
+                detail_level = detail if detail in ("simple", "standard", "detailed", "expert") else "standard"
+                thickness_clamped = max(1, min(4, thickness))
+                result = generate_line_art(img, page=page, detail_level=detail_level,
+                                           line_thickness=thickness_clamped)
+            elif mode == "voronoi":
+                colors = max(4, min(20, colors))
+                density_map = VORONOI_DENSITIES.get(page, VORONOI_DENSITIES["letter"])
+                num_cells = density_map.get(density, density_map["standard"])
+                result = generate_voronoi(img, colors=colors, density=num_cells, page=page)
+            else:
+                colors = max(4, min(20, colors))
+                cell_size = max(12, min(50, cell_size))
+                result = generate(img, colors=colors, cell_size=cell_size, page=page)
+            del img
+            gc.collect()
 
     # Consume quota — dual mode
     if user_id:
@@ -701,11 +704,15 @@ async def generate_mosaic(
 
     if isinstance(result, (CBNResult, PBNResult)):
         if output == "mystery":
-            return _svg_to_streaming(result.mystery_svg, f"{name}-mystery.svg")
+            if result.mystery_svg:
+                return _svg_to_streaming(result.mystery_svg, f"{name}-mystery.svg")
+            return _img_to_streaming(_add_watermark(result.mystery_png), f"{name}-mystery.png")
         if output == "answer":
-            return _svg_to_streaming(result.answer_svg, f"{name}-answer.svg")
-        if output == "beauty":
+            if result.answer_svg:
+                return _svg_to_streaming(result.answer_svg, f"{name}-answer.svg")
             return _img_to_streaming(_add_watermark(result.answer_png), f"{name}-answer.png")
+        if output == "beauty":
+            return _img_to_streaming(_add_watermark(result.mystery_full_png), f"{name}-preview.png")
         if output == "legend":
             return _img_to_streaming(_add_watermark(result.legend_png), f"{name}-legend.png")
         if output == "full":
