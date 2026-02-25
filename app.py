@@ -358,7 +358,7 @@ async def _ai_coloring_page(image_data: bytes, hint: str = "") -> Image.Image:
                 "prompt": prompt,
                 "n": "1",
                 "size": "1024x1024",
-                "quality": "low",
+                "quality": "medium",
             },
         )
         if img_resp.status_code != 200:
