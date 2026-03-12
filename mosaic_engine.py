@@ -1012,6 +1012,7 @@ def generate_cbn(
 
     source_img, source_mask = _prepare_image_and_mask(img)
     img = source_img.copy()
+    outline_img = source_img.copy()
 
     # Crop
     if crop:
@@ -1050,6 +1051,7 @@ def generate_cbn(
         s = min(tw / img.size[0], th / img.size[1])
         new_size = (int(img.size[0] * s), int(img.size[1] * s))
         img = img.resize(new_size, Image.LANCZOS)
+        outline_img = outline_img.resize(new_size, Image.LANCZOS)
         # Preserve source geometry for both outlines and zone shapes.
         source_img = source_img.resize(new_size, Image.NEAREST)
         if source_mask is not None:
@@ -1060,6 +1062,7 @@ def generate_cbn(
     w, h = img.size
 
     source_gray = np.array(source_img.convert("L"))
+    outline_gray = np.array(outline_img.convert("L"))
     raw_line_mask = source_gray <= 60
     if source_mask is not None:
         raw_line_mask &= source_mask
@@ -1123,8 +1126,18 @@ def generate_cbn(
     answer_svg = _pbn_to_svg(zones, palette, w, h, show_colors=True, show_numbers=False)
 
     # Render PNG
-    mystery_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=False, show_numbers=True, extra_outline_mask=line_mask)
-    answer_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=True, show_numbers=False, extra_outline_mask=line_mask)
+    mystery_png = _pbn_render_png(
+        zone_map, zones, palette, w, h,
+        show_colors=False, show_numbers=True,
+        extra_outline_mask=line_mask,
+        extra_outline_gray=outline_gray,
+    )
+    answer_png = _pbn_render_png(
+        zone_map, zones, palette, w, h,
+        show_colors=True, show_numbers=False,
+        extra_outline_mask=line_mask,
+        extra_outline_gray=outline_gray,
+    )
     del zone_map
 
     # Legend + combined
@@ -1467,34 +1480,60 @@ def _pbn_render_png(
     show_colors: bool = False,
     show_numbers: bool = True,
     extra_outline_mask: Optional[np.ndarray] = None,
+    extra_outline_gray: Optional[np.ndarray] = None,
 ) -> Image.Image:
     """Render PBN zones to PNG using numpy (no OpenCV).
 
-    Colors via direct zone_map indexing; outlines via morphological erosion.
+    Colors via direct zone_map indexing. Render at 2x then downsample so
+    contours and zone borders stay cleaner than direct pixel-edge rasterization.
     """
     from scipy import ndimage  # lazy import
 
-    arr = np.full((h, w, 3), 255, dtype=np.uint8)
-    struct = np.ones((3, 3), dtype=bool)
+    scale = 2
+    hs, ws = h * scale, w * scale
+    zone_map_hi = np.repeat(np.repeat(zone_map, scale, axis=0), scale, axis=1)
+    arr = np.full((hs, ws, 3), 255, dtype=np.uint8)
 
     # Paint all zones
     for zone in zones:
         ci = zone["color"]
-        mask = (zone_map == zone["id"])
+        mask = (zone_map_hi == zone["id"])
         if show_colors:
             arr[mask] = palette[ci]
 
     # Draw region boundaries once globally so adjacent zones don't create
     # doubled/thick outlines.
-    boundary = np.zeros((h, w), dtype=bool)
-    boundary[1:, :] |= zone_map[1:, :] != zone_map[:-1, :]
-    boundary[:-1, :] |= zone_map[:-1, :] != zone_map[1:, :]
-    boundary[:, 1:] |= zone_map[:, 1:] != zone_map[:, :-1]
-    boundary[:, :-1] |= zone_map[:, :-1] != zone_map[:, 1:]
-    boundary &= zone_map > 0
+    boundary = np.zeros((hs, ws), dtype=bool)
+    boundary[1:, :] |= zone_map_hi[1:, :] != zone_map_hi[:-1, :]
+    boundary[:-1, :] |= zone_map_hi[:-1, :] != zone_map_hi[1:, :]
+    boundary[:, 1:] |= zone_map_hi[:, 1:] != zone_map_hi[:, :-1]
+    boundary[:, :-1] |= zone_map_hi[:, :-1] != zone_map_hi[:, 1:]
+    boundary &= zone_map_hi > 0
     if extra_outline_mask is not None:
-        boundary |= extra_outline_mask
+        outline_mask_hi = np.repeat(np.repeat(extra_outline_mask, scale, axis=0), scale, axis=1)
+        boundary |= outline_mask_hi
+    else:
+        outline_mask_hi = None
     arr[boundary] = [30, 30, 30]
+
+    # When the source drawing is available, overlay its grayscale line art so
+    # final outlines keep the source anti-aliasing instead of a jagged binary edge.
+    if extra_outline_gray is not None and outline_mask_hi is not None:
+        smooth_outline = ndimage.binary_dilation(
+            outline_mask_hi,
+            structure=np.ones((3, 3), dtype=bool),
+            iterations=1,
+        )
+        gray = np.asarray(
+            Image.fromarray(np.asarray(extra_outline_gray, dtype=np.uint8), "L").resize((ws, hs), Image.LANCZOS),
+            dtype=np.uint8,
+        )
+        overlay_mask = smooth_outline & (gray < 245)
+        if overlay_mask.any():
+            arr[overlay_mask] = np.minimum(
+                arr[overlay_mask],
+                np.repeat(gray[overlay_mask, None], 3, axis=1),
+            )
 
     img = Image.fromarray(arr, "RGB")
     del arr
@@ -1507,18 +1546,18 @@ def _pbn_render_png(
             fs = min(fs, max(7, int(radius * 1.15)))
         draw_probe = ImageDraw.Draw(img)
         while fs > 6:
-            font = _get_font(fs)
+            font = _get_font(fs * scale)
             bb = draw_probe.textbbox((0, 0), num, font=font)
             tw_txt, th_txt = bb[2] - bb[0], bb[3] - bb[1]
-            pad = 3
+            pad = 3 * scale
             rx = (tw_txt + pad * 2) / 2.0
             ry = (th_txt + pad * 2) / 2.0
-            if radius <= 0 or max(rx, ry) <= radius * 0.82:
+            if radius <= 0 or max(rx, ry) <= radius * scale * 0.82:
                 return font, fs, tw_txt, th_txt, pad
             fs -= 1
-        font = _get_font(6)
+        font = _get_font(6 * scale)
         bb = draw_probe.textbbox((0, 0), num, font=font)
-        return font, 6, bb[2] - bb[0], bb[3] - bb[1], 2
+        return font, 6, bb[2] - bb[0], bb[3] - bb[1], 2 * scale
 
     # Draw numbers with Pillow
     if show_numbers:
@@ -1531,8 +1570,8 @@ def _pbn_render_png(
             num = str(ci + 1)
             font, fs, tw_txt, th_txt, pad = _fit_font(zone, num)
 
-            tx = cx - tw_txt // 2
-            ty = cy - th_txt // 2
+            tx = int(round(cx * scale - tw_txt / 2))
+            ty = int(round(cy * scale - th_txt / 2))
 
             draw.ellipse(
                 [tx - pad, ty - pad, tx + tw_txt + pad, ty + th_txt + pad],
@@ -1540,7 +1579,7 @@ def _pbn_render_png(
             )
             draw.text((tx, ty), num, fill=(60, 60, 60), font=font)
 
-    return img
+    return img.resize((w, h), Image.LANCZOS)
 
 
 def generate_pbn(
