@@ -883,6 +883,107 @@ def _cbn_find_closed_line_regions(
     return zone_map, zones
 
 
+def _cbn_find_hybrid_zones(
+    label_map: np.ndarray,
+    palette: np.ndarray,
+    fill_mask: np.ndarray,
+    min_zone_pixels: int = 500,
+    subzone_min_pixels: int = 7000,
+    subzone_min_fill_ratio: float = 0.10,
+    subzone_min_radius: float = 8.0,
+    subzone_keep_radius: float = 18.0,
+) -> Tuple[np.ndarray, list]:
+    """Split only meaningful color subzones inside closed source compartments.
+
+    Geometry comes from the original closed compartments in ``fill_mask``.
+    Color quantization may only carve out substantial internal islands, which
+    preserves thin source features such as ears while keeping cheeks/spots.
+    """
+    from scipy import ndimage  # lazy import
+
+    h, w = fill_mask.shape
+    zone_map = np.zeros((h, w), dtype=np.int32)
+    zone_colors = {}
+    zone_id = 0
+
+    labeled, _ = ndimage.label(fill_mask.astype(np.uint8))
+    slices = ndimage.find_objects(labeled)
+
+    for rid, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+
+        crop = labeled[sl]
+        compartment_mask = crop == rid
+        area = int(compartment_mask.sum())
+        if area < min_zone_pixels:
+            continue
+
+        touches_border = (
+            (sl[0].start == 0 and compartment_mask[0, :].any()) or
+            (sl[0].stop == h and compartment_mask[-1, :].any()) or
+            (sl[1].start == 0 and compartment_mask[:, 0].any()) or
+            (sl[1].stop == w and compartment_mask[:, -1].any())
+        )
+        if touches_border:
+            continue
+
+        compartment_labels = label_map[sl][compartment_mask]
+        compartment_labels = compartment_labels[compartment_labels >= 0]
+        if compartment_labels.size == 0:
+            continue
+        dominant_color = int(np.bincount(compartment_labels, minlength=len(palette)).argmax())
+
+        compartment_zones = np.zeros(compartment_mask.shape, dtype=np.int32)
+
+        for ci in range(len(palette)):
+            if ci == dominant_color:
+                continue
+
+            color_mask = compartment_mask & (label_map[sl] == ci)
+            if not color_mask.any():
+                continue
+
+            sub_labeled, _ = ndimage.label(color_mask.astype(np.uint8))
+            sub_slices = ndimage.find_objects(sub_labeled)
+            for sub_rid, sub_sl in enumerate(sub_slices, start=1):
+                if sub_sl is None:
+                    continue
+                sub_crop = sub_labeled[sub_sl]
+                sub_mask = sub_crop == sub_rid
+                sub_mask = ndimage.binary_opening(sub_mask, structure=_disk_kernel(1))
+                sub_mask = ndimage.binary_closing(sub_mask, structure=_disk_kernel(1))
+                if not sub_mask.any():
+                    continue
+                sub_area = int(sub_mask.sum())
+                if sub_area < subzone_min_pixels:
+                    continue
+
+                ys, xs = np.where(sub_mask)
+                bbox_area = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
+                fill_ratio = sub_area / max(1, bbox_area)
+                radius = float(ndimage.distance_transform_edt(sub_mask).max())
+                if radius < subzone_min_radius:
+                    continue
+                if fill_ratio < subzone_min_fill_ratio and radius < subzone_keep_radius:
+                    continue
+
+                zone_id += 1
+                compartment_zones[sub_sl][sub_mask] = zone_id
+                zone_colors[zone_id] = ci
+
+        remaining_mask = compartment_mask & (compartment_zones == 0)
+        if remaining_mask.any():
+            zone_id += 1
+            compartment_zones[remaining_mask] = zone_id
+            zone_colors[zone_id] = dominant_color
+
+        zone_map[sl][compartment_zones > 0] = compartment_zones[compartment_zones > 0]
+
+    zones = _rebuild_zones_from_zone_map(zone_map, zone_colors)
+    return zone_map, zones
+
+
 def generate_cbn(
     img: Image.Image,
     colors: int = 10,
@@ -897,6 +998,8 @@ def generate_cbn(
     Pipeline: preprocess → quantize → find zones → Potrace trace →
               render SVG + PNG → legend → return CBNResult.
     """
+    from scipy import ndimage  # lazy import
+
     source_img, source_mask = _prepare_image_and_mask(img)
     img = source_img.copy()
 
@@ -947,15 +1050,29 @@ def generate_cbn(
     w, h = img.size
 
     source_gray = np.array(source_img.convert("L"))
-    line_mask = source_gray <= 60
+    raw_line_mask = source_gray <= 60
     if source_mask is not None:
-        fill_mask = source_mask & ~line_mask
+        raw_line_mask &= source_mask
+        base_fill_mask = source_mask & ~raw_line_mask
     else:
-        fill_mask = ~line_mask
+        base_fill_mask = ~raw_line_mask
+
+    # Seal only tiny outline gaps so closed compartments stay intact without
+    # thickening or reshaping thin features from the source drawing.
+    line_mask = raw_line_mask
+    if raw_line_mask.any():
+        closed_line_mask = ndimage.binary_closing(raw_line_mask, structure=_disk_kernel(1))
+        if source_mask is not None:
+            closed_line_mask &= source_mask
+        sealed_fill_mask = (~closed_line_mask)
+        if source_mask is not None:
+            sealed_fill_mask &= source_mask
+        fill_mask = sealed_fill_mask & base_fill_mask
+    else:
+        fill_mask = base_fill_mask
 
     # Exclude alpha fringe from quantization, then grow labels back into the
     # full fill mask so semi-transparent borders don't become false white zones.
-    from scipy import ndimage  # lazy import
     quant_mask = fill_mask.copy()
     if quant_mask.any():
         eroded = ndimage.binary_erosion(quant_mask, structure=np.ones((3, 3), dtype=bool), iterations=2)
@@ -970,11 +1087,19 @@ def generate_cbn(
     label_map = _expand_labels_into_mask(label_map, fill_mask)
     label_map = _smooth_label_map(label_map, fill_mask, colors, iterations=2)
 
-    # Use connected components of the quantized subject as the zone basis.
-    # This keeps the silhouette exact while preserving closed color regions
-    # such as cheeks, spots, belly and tail details.
+    # Compartments come from the source drawing; color only splits substantial
+    # interior islands so quantization never redraws the source geometry.
     effective_min_zone_pixels = max(min_zone_pixels, 8000)
-    zone_map, zones = _cbn_find_zones(label_map, colors, effective_min_zone_pixels)
+    zone_map, zones = _cbn_find_hybrid_zones(
+        label_map,
+        palette,
+        fill_mask,
+        min_zone_pixels=effective_min_zone_pixels,
+        subzone_min_pixels=7000,
+        subzone_min_fill_ratio=0.10,
+        subzone_min_radius=8.0,
+        subzone_keep_radius=18.0,
+    )
     zone_map, zones = _merge_sparse_zones(zone_map, zones)
     del label_map, source_img
 
