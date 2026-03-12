@@ -890,8 +890,10 @@ def _cbn_find_hybrid_zones(
     min_zone_pixels: int = 500,
     subzone_min_pixels: int = 7000,
     subzone_min_fill_ratio: float = 0.10,
+    compact_subzone_min_pixels: int = 1000,
+    compact_subzone_min_fill_ratio: float = 0.60,
+    compact_subzone_min_radius: float = 10.0,
     subzone_min_radius: float = 8.0,
-    subzone_keep_radius: float = 18.0,
 ) -> Tuple[np.ndarray, list]:
     """Split only meaningful color subzones inside closed source compartments.
 
@@ -956,16 +958,24 @@ def _cbn_find_hybrid_zones(
                 if not sub_mask.any():
                     continue
                 sub_area = int(sub_mask.sum())
-                if sub_area < subzone_min_pixels:
+                if sub_area < min(subzone_min_pixels, compact_subzone_min_pixels):
                     continue
 
                 ys, xs = np.where(sub_mask)
                 bbox_area = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
                 fill_ratio = sub_area / max(1, bbox_area)
                 radius = float(ndimage.distance_transform_edt(sub_mask).max())
-                if radius < subzone_min_radius:
-                    continue
-                if fill_ratio < subzone_min_fill_ratio and radius < subzone_keep_radius:
+                keep_large = (
+                    sub_area >= subzone_min_pixels and
+                    fill_ratio >= subzone_min_fill_ratio and
+                    radius >= subzone_min_radius
+                )
+                keep_compact = (
+                    sub_area >= compact_subzone_min_pixels and
+                    fill_ratio >= compact_subzone_min_fill_ratio and
+                    radius >= compact_subzone_min_radius
+                )
+                if not (keep_large or keep_compact):
                     continue
 
                 zone_id += 1
@@ -1040,7 +1050,7 @@ def generate_cbn(
         s = min(tw / img.size[0], th / img.size[1])
         new_size = (int(img.size[0] * s), int(img.size[1] * s))
         img = img.resize(new_size, Image.LANCZOS)
-        # Preserve line geometry when detecting closed regions.
+        # Preserve source geometry for both outlines and zone shapes.
         source_img = source_img.resize(new_size, Image.NEAREST)
         if source_mask is not None:
             source_mask = np.array(
@@ -1097,8 +1107,10 @@ def generate_cbn(
         min_zone_pixels=effective_min_zone_pixels,
         subzone_min_pixels=7000,
         subzone_min_fill_ratio=0.10,
+        compact_subzone_min_pixels=1000,
+        compact_subzone_min_fill_ratio=0.60,
+        compact_subzone_min_radius=10.0,
         subzone_min_radius=8.0,
-        subzone_keep_radius=18.0,
     )
     zone_map, zones = _merge_sparse_zones(zone_map, zones)
     del label_map, source_img
