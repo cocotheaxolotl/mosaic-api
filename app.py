@@ -44,7 +44,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Bod
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from database import init_db
 import auth as auth_module
@@ -204,7 +204,11 @@ def _consume(request: Request, n: int = 1):
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 def _read_image(data: bytes) -> Image.Image:
-    img = Image.open(io.BytesIO(data)).convert("RGB")
+    img = Image.open(io.BytesIO(data))
+    img = ImageOps.exif_transpose(img)
+    # Preserve alpha for PNG illustrations; the engine will normalize it.
+    if img.mode not in ("RGB", "RGBA"):
+        img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
     # Cap input to 1500px on longest side to save RAM on 2GB VM
     MAX_DIM = 1500
     if max(img.size) > MAX_DIM:
@@ -649,7 +653,7 @@ async def generate_mosaic(
             ai_img = _add_watermark(ai_img)
         return _img_to_streaming(ai_img, f"{name}-coloring.png")
 
-    # Smart CBN: GPT line art + original colors (10 credits, account required)
+    # CBN/PBN require an account or promo code.
     if mode in ("cbn", "pbn"):
         if not user_id and not promo:
             raise HTTPException(403, "Color by Number requires an account. Sign up free at univers.studio!")
@@ -659,10 +663,16 @@ async def generate_mosaic(
                 raise HTTPException(402, {"error": "Not enough credits", "remaining": balance, "required": 10,
                     "message": "Color by Number costs 10 credits. Upgrade your plan!", "upgrade_url": "https://univers.studio/pricing/"})
         colors = max(4, min(20, colors))
-        line_art = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
         async with _gen_semaphore:
-            result = generate_smart_cbn(img, line_art, colors=colors, page=page)
-            del img, line_art
+            if mode == "cbn":
+                # Preserve the uploaded artwork geometry. The previous AI-regenerated
+                # line art changed features and only labeled one region per color.
+                result = generate_cbn(img, colors=colors, page=page, min_zone_pixels=150)
+                del img
+            else:
+                line_art = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
+                result = generate_smart_cbn(img, line_art, colors=colors, page=page)
+                del img, line_art
             gc.collect()
     else:
         # Generate (semaphore: only 1 at a time to prevent OOM)

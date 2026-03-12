@@ -35,6 +35,41 @@ def _get_font(size: int) -> ImageFont.FreeTypeFont:
     return ImageFont.load_default()
 
 
+def _prepare_image_and_mask(img: Image.Image, alpha_threshold: int = 32) -> Tuple[Image.Image, Optional[np.ndarray]]:
+    """Normalize input artwork to RGB on white and extract a subject mask.
+
+    For transparent PNGs, this preserves the visible artwork while excluding
+    detached transparent artifacts from later color/zone analysis.
+    """
+    from scipy import ndimage  # lazy import
+
+    if img.mode != "RGBA":
+        rgba = img.convert("RGBA")
+    else:
+        rgba = img.copy()
+
+    alpha = np.array(rgba.getchannel("A"))
+    if alpha.max() <= 0:
+        return rgba.convert("RGB"), None
+
+    raw_mask = alpha >= alpha_threshold
+    labeled, n = ndimage.label(raw_mask)
+    if n <= 0:
+        return rgba.convert("RGB"), None
+
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0
+    main_id = int(np.argmax(sizes))
+    subject_mask = labeled == main_id
+
+    arr = np.array(rgba, dtype=np.uint8)
+    rgb = arr[:, :, :3]
+    comp = np.full_like(rgb, 255, dtype=np.uint8)
+    comp[subject_mask] = rgb[subject_mask]
+    comp_img = Image.fromarray(comp, "RGB")
+    return comp_img, subject_mask
+
+
 # ── Color helpers ────────────────────────────────────────────────────────
 
 def rgb_to_name(r: int, g: int, b: int) -> str:
@@ -87,8 +122,14 @@ def _hex_grid(w: int, h: int, cell: int):
 
 # ── Quantization ─────────────────────────────────────────────────────────
 
-def _quantize(img: Image.Image, n: int):
-    pixels = np.array(img).reshape(-1, 3).astype(np.float32)
+def _quantize(img: Image.Image, n: int, mask: Optional[np.ndarray] = None):
+    arr = np.array(img)
+    flat = arr.reshape(-1, 3).astype(np.float32)
+    if mask is not None:
+        mask_flat = mask.reshape(-1)
+        pixels = flat[mask_flat]
+    else:
+        pixels = flat
     # Subsample for fast clustering, then predict all pixels
     MAX_SAMPLES = 50_000
     if len(pixels) > MAX_SAMPLES:
@@ -98,7 +139,7 @@ def _quantize(img: Image.Image, n: int):
         sample = pixels
     km = MiniBatchKMeans(n_clusters=n, random_state=42, batch_size=1024, n_init=3)
     km.fit(sample)
-    labels = km.predict(pixels)
+    labels_all = km.predict(flat)
     palette = km.cluster_centers_.astype(np.uint8)
 
     # Shuffle so number order doesn't reveal the image
@@ -108,13 +149,70 @@ def _quantize(img: Image.Image, n: int):
     remap = np.zeros(n, dtype=int)
     for new, old in enumerate(order):
         remap[old] = new
-    labels = remap[labels]
+    labels_all = remap[labels_all]
     palette = palette[order]
 
-    return labels.reshape(img.size[1], img.size[0]), palette
+    return labels_all.reshape(img.size[1], img.size[0]), palette
 
 
-def _flatten_background(img: Image.Image, tolerance: int = 60) -> Image.Image:
+def _smooth_label_map(label_map: np.ndarray, fill_mask: np.ndarray, n_colors: int, iterations: int = 1) -> np.ndarray:
+    """Majority-filter the quantized labels inside the drawable subject only."""
+    from scipy import ndimage  # lazy import
+
+    out = label_map.copy()
+    kernel = np.ones((3, 3), dtype=np.int16)
+    for _ in range(iterations):
+        scores = []
+        for ci in range(n_colors):
+            scores.append(
+                ndimage.convolve((out == ci).astype(np.int16), kernel, mode="nearest")
+            )
+        stacked = np.stack(scores, axis=0)
+        smoothed = np.argmax(stacked, axis=0).astype(out.dtype)
+        out[fill_mask] = smoothed[fill_mask]
+    return out
+
+
+def _expand_labels_into_mask(label_map: np.ndarray, target_mask: np.ndarray, iterations: int = 32) -> np.ndarray:
+    """Fill unlabeled pixels inside target_mask from neighboring labeled pixels."""
+    from scipy import ndimage  # lazy import
+
+    out = label_map.copy()
+    for _ in range(iterations):
+        missing = target_mask & (out < 0)
+        if not missing.any():
+            break
+
+        candidates = []
+        for shift_y, shift_x in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            shifted = np.roll(out, shift=(shift_y, shift_x), axis=(0, 1))
+            if shift_y == -1:
+                shifted[-1, :] = -1
+            elif shift_y == 1:
+                shifted[0, :] = -1
+            if shift_x == -1:
+                shifted[:, -1] = -1
+            elif shift_x == 1:
+                shifted[:, 0] = -1
+            candidates.append(shifted)
+
+        stacked = np.stack(candidates, axis=0)
+        valid = stacked >= 0
+        if not valid.any():
+            break
+
+        # Majority vote among available neighbors.
+        fill_values = out.copy()
+        for y, x in zip(*np.where(missing)):
+            vals = stacked[:, y, x]
+            vals = vals[vals >= 0]
+            if vals.size:
+                fill_values[y, x] = int(np.bincount(vals).argmax())
+        out[missing] = fill_values[missing]
+    return out
+
+
+def _flatten_background(img: Image.Image, tolerance: int = 60, subject_mask: Optional[np.ndarray] = None) -> Image.Image:
     """Detect dominant border color and replace similar pixels with white.
 
     Samples a 5-pixel band around all four edges, finds the most common color
@@ -148,6 +246,8 @@ def _flatten_background(img: Image.Image, tolerance: int = 60) -> Image.Image:
     # Replace pixels close to the dominant border color with white
     dist = np.linalg.norm(arr - dominant, axis=2)
     mask = dist < tolerance
+    if subject_mask is not None:
+        mask &= ~subject_mask
     out = arr.copy()
     out[mask] = [255, 255, 255]
 
@@ -506,7 +606,7 @@ def _cbn_find_zones(
 
     Returns (zone_map, zones) where:
       - zone_map: int32 array, each pixel → zone_id (0 = unassigned/too small)
-      - zones: list of {"id", "color", "centroid", "area"} dicts
+      - zones: list of {"id", "color", "centroid", "label_pos", "area"} dicts
 
     Optimized: uses find_objects() for fast bounding-box slicing instead of
     scanning the full image per zone.
@@ -552,14 +652,234 @@ def _cbn_find_zones(
                 nearest = np.argmin(dists)
                 cy, cx = int(ys_full[nearest]), int(xs_full[nearest])
 
+            # Prefer the point farthest from the outline for label placement.
+            dist = ndimage.distance_transform_edt(crop_mask)
+            ly_local, lx_local = np.unravel_index(np.argmax(dist), dist.shape)
+            ly = int(ly_local) + sl[0].start
+            lx = int(lx_local) + sl[1].start
+            label_radius = float(dist[ly_local, lx_local])
+            if label_radius <= 0:
+                ly, lx = cy, cx
+                label_radius = 0.0
+
+            touches_border = (
+                (sl[0].start == 0 and crop_mask[0, :].any()) or
+                (sl[0].stop == h and crop_mask[-1, :].any()) or
+                (sl[1].start == 0 and crop_mask[:, 0].any()) or
+                (sl[1].stop == w and crop_mask[:, -1].any())
+            )
+
             zones.append({
                 "id": zone_id,
                 "color": ci,
                 "centroid": (cy, cx),
+                "label_pos": (ly, lx),
+                "label_radius": label_radius,
                 "area": area,
+                "touches_border": touches_border,
             })
 
         del labeled
+    return zone_map, zones
+
+
+def _rebuild_zones_from_zone_map(zone_map: np.ndarray, zone_colors: dict) -> list:
+    """Recompute zone metadata after zone_map edits/merges."""
+    from scipy import ndimage  # lazy import
+
+    zones = []
+    max_id = int(zone_map.max()) if zone_map.size else 0
+    if max_id <= 0:
+        return zones
+
+    slices = ndimage.find_objects(zone_map.astype(np.int32))
+    h, w = zone_map.shape
+    for zid in range(1, max_id + 1):
+        sl = slices[zid - 1] if zid - 1 < len(slices) else None
+        if sl is None:
+            continue
+        crop = zone_map[sl]
+        crop_mask = crop == zid
+        area = int(crop_mask.sum())
+        if area <= 0:
+            continue
+
+        ys, xs = np.where(crop_mask)
+        cy = int(ys.mean()) + sl[0].start
+        cx = int(xs.mean()) + sl[1].start
+
+        dist = ndimage.distance_transform_edt(crop_mask)
+        ly_local, lx_local = np.unravel_index(np.argmax(dist), dist.shape)
+        ly = int(ly_local) + sl[0].start
+        lx = int(lx_local) + sl[1].start
+        label_radius = float(dist[ly_local, lx_local])
+        if label_radius <= 0:
+            ly, lx = cy, cx
+            label_radius = 0.0
+
+        touches_border = (
+            (sl[0].start == 0 and crop_mask[0, :].any()) or
+            (sl[0].stop == h and crop_mask[-1, :].any()) or
+            (sl[1].start == 0 and crop_mask[:, 0].any()) or
+            (sl[1].stop == w and crop_mask[:, -1].any())
+        )
+
+        zones.append({
+            "id": zid,
+            "color": zone_colors[zid],
+            "centroid": (cy, cx),
+            "label_pos": (ly, lx),
+            "label_radius": label_radius,
+            "area": area,
+            "touches_border": touches_border,
+        })
+    return zones
+
+
+def _merge_sparse_zones(zone_map: np.ndarray, zones: list) -> Tuple[np.ndarray, list]:
+    """Merge thin/irregular artifact zones into the strongest adjacent zone."""
+    from scipy import ndimage  # lazy import
+
+    if not zones:
+        return zone_map, zones
+
+    zone_map = zone_map.copy()
+    zone_colors = {z["id"]: z["color"] for z in zones}
+    struct = np.ones((3, 3), dtype=bool)
+
+    candidates = []
+    for z in zones:
+        mask = zone_map == z["id"]
+        ys, xs = np.where(mask)
+        if ys.size == 0:
+            continue
+        bbox_area = (ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)
+        fill_ratio = z["area"] / max(1, bbox_area)
+        radius = float(z.get("label_radius", 0.0))
+        is_sparse = (
+            (fill_ratio < 0.08 and z["area"] < 25000) or
+            (radius < 4.5 and z["area"] < 20000)
+        )
+        if is_sparse:
+            candidates.append(z["id"])
+
+    for zid in candidates:
+        mask = zone_map == zid
+        if not mask.any():
+            continue
+        dilated = ndimage.binary_dilation(mask, structure=struct, iterations=2)
+        border = dilated & ~mask
+        neighbors = zone_map[border]
+        neighbors = neighbors[(neighbors > 0) & (neighbors != zid)]
+        if neighbors.size == 0:
+            continue
+        target = int(np.bincount(neighbors).argmax())
+        zone_map[mask] = target
+
+    remaining_ids = sorted(int(v) for v in np.unique(zone_map) if v > 0)
+    if not remaining_ids:
+        return zone_map, []
+
+    remap = {old: new for new, old in enumerate(remaining_ids, start=1)}
+    new_map = np.zeros_like(zone_map)
+    new_colors = {}
+    for old, new in remap.items():
+        new_map[zone_map == old] = new
+        new_colors[new] = zone_colors[old]
+
+    return new_map, _rebuild_zones_from_zone_map(new_map, new_colors)
+
+
+def _cbn_find_closed_line_regions(
+    img: Image.Image,
+    palette: np.ndarray,
+    min_zone_pixels: int = 150,
+    dark_threshold: int = 60,
+    subject_mask: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, list]:
+    """Find closed regions from the source image's dark outlines.
+
+    This preserves the original drawing geometry for inked/cartoon artwork:
+    1. detect dark contour pixels from the uploaded image
+    2. slightly close/thicken them so regions seal cleanly
+    3. label enclosed white spaces
+    4. assign each closed region the nearest palette color from its average RGB
+    """
+    from scipy import ndimage  # lazy import
+
+    rgb = np.array(img.convert("RGB"), dtype=np.float32)
+    gray = np.array(img.convert("L"))
+    line_mask = gray <= dark_threshold
+    if not line_mask.any():
+        return np.zeros(gray.shape, dtype=np.int32), []
+
+    # Keep geometry conservative: only seal tiny gaps, do not thicken contours.
+    kernel = _disk_kernel(2)
+    line_mask = ndimage.binary_closing(line_mask, structure=kernel)
+
+    open_space = ~line_mask
+    if subject_mask is not None:
+        open_space &= subject_mask
+    labeled, _ = ndimage.label(open_space)
+    slices = ndimage.find_objects(labeled)
+
+    h, w = gray.shape
+    zone_map = np.zeros((h, w), dtype=np.int32)
+    zones = []
+    zone_id = 0
+
+    for rid, sl in enumerate(slices, start=1):
+        if sl is None:
+            continue
+
+        crop = labeled[sl]
+        crop_mask = (crop == rid)
+        area = int(crop_mask.sum())
+        if area < min_zone_pixels:
+            continue
+
+        touches_border = (
+            (sl[0].start == 0 and crop_mask[0, :].any()) or
+            (sl[0].stop == h and crop_mask[-1, :].any()) or
+            (sl[1].start == 0 and crop_mask[:, 0].any()) or
+            (sl[1].stop == w and crop_mask[:, -1].any())
+        )
+        if touches_border:
+            continue
+
+        region_rgb = rgb[sl][crop_mask]
+        if region_rgb.size == 0:
+            continue
+        mean_rgb = region_rgb.mean(axis=0)
+        dists = np.sum((palette.astype(np.float32) - mean_rgb) ** 2, axis=1)
+        color_id = int(np.argmin(dists))
+
+        zone_id += 1
+        zone_map[sl][crop_mask] = zone_id
+
+        ys, xs = np.where(crop_mask)
+        cy = int(ys.mean()) + sl[0].start
+        cx = int(xs.mean()) + sl[1].start
+
+        dist = ndimage.distance_transform_edt(crop_mask)
+        ly_local, lx_local = np.unravel_index(np.argmax(dist), dist.shape)
+        ly = int(ly_local) + sl[0].start
+        lx = int(lx_local) + sl[1].start
+        label_radius = float(dist[ly_local, lx_local])
+        if label_radius <= 0:
+            ly, lx = cy, cx
+            label_radius = 0.0
+
+        zones.append({
+            "id": zone_id,
+            "color": color_id,
+            "centroid": (cy, cx),
+            "label_pos": (ly, lx),
+            "label_radius": label_radius,
+            "area": area,
+            "touches_border": False,
+        })
+
     return zone_map, zones
 
 
@@ -577,7 +897,8 @@ def generate_cbn(
     Pipeline: preprocess → quantize → find zones → Potrace trace →
               render SVG + PNG → legend → return CBNResult.
     """
-    img = img.convert("RGB")
+    source_img, source_mask = _prepare_image_and_mask(img)
+    img = source_img.copy()
 
     # Crop
     if crop:
@@ -589,13 +910,22 @@ def generate_cbn(
                 int(w * lp / 100), int(h * tp / 100),
                 int(w * (100 - rp) / 100), int(h * (100 - bp) / 100),
             ))
+            source_img = source_img.crop((
+                int(w * lp / 100), int(h * tp / 100),
+                int(w * (100 - rp) / 100), int(h * (100 - bp) / 100),
+            ))
+            if source_mask is not None:
+                source_mask = source_mask[
+                    int(h * tp / 100):int(h * (100 - bp) / 100),
+                    int(w * lp / 100):int(w * (100 - rp) / 100),
+                ]
 
     # Blur (smooths noise in photos → cleaner zones)
     if blur > 0:
         img = img.filter(ImageFilter.GaussianBlur(radius=blur))
 
     # Flatten background: replace dominant border color with white
-    img = _flatten_background(img)
+    img = _flatten_background(img, subject_mask=source_mask)
 
     # Fit to page
     if page and page in PAGE_SIZES:
@@ -605,16 +935,48 @@ def generate_cbn(
         margin = 50
         tw, th = pw - 2 * margin, ph - 2 * margin
         s = min(tw / img.size[0], th / img.size[1])
-        img = img.resize((int(img.size[0] * s), int(img.size[1] * s)), Image.LANCZOS)
+        new_size = (int(img.size[0] * s), int(img.size[1] * s))
+        img = img.resize(new_size, Image.LANCZOS)
+        # Preserve line geometry when detecting closed regions.
+        source_img = source_img.resize(new_size, Image.NEAREST)
+        if source_mask is not None:
+            source_mask = np.array(
+                Image.fromarray((source_mask.astype(np.uint8) * 255), "L").resize(new_size, Image.NEAREST)
+            ) > 0
 
     w, h = img.size
 
-    # Quantize
-    label_map, palette = _quantize(img, colors)
+    source_gray = np.array(source_img.convert("L"))
+    line_mask = source_gray <= 60
+    if source_mask is not None:
+        fill_mask = source_mask & ~line_mask
+    else:
+        fill_mask = ~line_mask
 
-    # Find zones
-    zone_map, zones = _cbn_find_zones(label_map, colors, min_zone_pixels)
-    del label_map
+    # Exclude alpha fringe from quantization, then grow labels back into the
+    # full fill mask so semi-transparent borders don't become false white zones.
+    from scipy import ndimage  # lazy import
+    quant_mask = fill_mask.copy()
+    if quant_mask.any():
+        eroded = ndimage.binary_erosion(quant_mask, structure=np.ones((3, 3), dtype=bool), iterations=2)
+        if eroded.any():
+            quant_mask = eroded
+
+    # Quantize only the fillable subject regions, not the black outlines.
+    label_map, palette = _quantize(img, colors, mask=quant_mask)
+    label_map = label_map.copy()
+    label_map[~fill_mask] = -1
+    label_map[fill_mask & ~quant_mask] = -1
+    label_map = _expand_labels_into_mask(label_map, fill_mask)
+    label_map = _smooth_label_map(label_map, fill_mask, colors, iterations=2)
+
+    # Use connected components of the quantized subject as the zone basis.
+    # This keeps the silhouette exact while preserving closed color regions
+    # such as cheeks, spots, belly and tail details.
+    effective_min_zone_pixels = max(min_zone_pixels, 8000)
+    zone_map, zones = _cbn_find_zones(label_map, colors, effective_min_zone_pixels)
+    zone_map, zones = _merge_sparse_zones(zone_map, zones)
+    del label_map, source_img
 
     # Extract contours with Potrace (smooth Bezier curves)
     zones = _pbn_extract_paths(zone_map, zones)
@@ -624,8 +986,8 @@ def generate_cbn(
     answer_svg = _pbn_to_svg(zones, palette, w, h, show_colors=True, show_numbers=False)
 
     # Render PNG
-    mystery_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=False, show_numbers=True)
-    answer_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=True, show_numbers=False)
+    mystery_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=False, show_numbers=True, extra_outline_mask=line_mask)
+    answer_png = _pbn_render_png(zone_map, zones, palette, w, h, show_colors=True, show_numbers=False, extra_outline_mask=line_mask)
     del zone_map
 
     # Legend + combined
@@ -911,6 +1273,18 @@ def _pbn_to_svg(
         )
     parts.append('</style>\n')
 
+    def _label_metrics(zone: dict) -> Tuple[int, float]:
+        area = max(1, int(zone["area"]))
+        radius = float(zone.get("label_radius", 0.0))
+        fs_area = max(8, min(28, int(14 * (area / 3000) ** 0.25)))
+        if radius > 0:
+            fs = min(fs_area, max(7, int(radius * 1.15)))
+            bubble_r = min(radius * 0.82, max(fs * 0.58, fs * 0.42 * len(str(zone["color"] + 1))))
+        else:
+            fs = fs_area
+            bubble_r = fs * 0.55 * max(1.0, len(str(zone["color"] + 1)) * 0.6)
+        return fs, bubble_r
+
     # Draw zones with Bezier paths
     for zone in zones:
         ci = zone["color"]
@@ -927,13 +1301,12 @@ def _pbn_to_svg(
     # Numbers layer (on top)
     if show_numbers:
         for zone in zones:
+            if zone.get("touches_border"):
+                continue
             ci = zone["color"]
-            cy, cx = zone["centroid"]
+            cy, cx = zone.get("label_pos", zone["centroid"])
             num = str(ci + 1)
-            area = zone["area"]
-
-            fs = max(8, min(28, int(14 * (area / 3000) ** 0.25)))
-            r_bg = fs * 0.55 * max(1.0, len(num) * 0.6)
+            fs, r_bg = _label_metrics(zone)
 
             parts.append(
                 f'<circle cx="{cx}" cy="{cy}" r="{r_bg:.0f}" '
@@ -956,6 +1329,7 @@ def _pbn_render_png(
     h: int,
     show_colors: bool = False,
     show_numbers: bool = True,
+    extra_outline_mask: Optional[np.ndarray] = None,
 ) -> Image.Image:
     """Render PBN zones to PNG using numpy (no OpenCV).
 
@@ -972,32 +1346,57 @@ def _pbn_render_png(
         mask = (zone_map == zone["id"])
         if show_colors:
             arr[mask] = palette[ci]
-        # Outline: erode mask, XOR to get boundary pixels
-        eroded = ndimage.binary_erosion(mask, structure=struct)
-        boundary = mask & ~eroded
-        arr[boundary] = [30, 30, 30]
+
+    # Draw region boundaries once globally so adjacent zones don't create
+    # doubled/thick outlines.
+    boundary = np.zeros((h, w), dtype=bool)
+    boundary[1:, :] |= zone_map[1:, :] != zone_map[:-1, :]
+    boundary[:-1, :] |= zone_map[:-1, :] != zone_map[1:, :]
+    boundary[:, 1:] |= zone_map[:, 1:] != zone_map[:, :-1]
+    boundary[:, :-1] |= zone_map[:, :-1] != zone_map[:, 1:]
+    boundary &= zone_map > 0
+    if extra_outline_mask is not None:
+        boundary |= extra_outline_mask
+    arr[boundary] = [30, 30, 30]
 
     img = Image.fromarray(arr, "RGB")
     del arr
+
+    def _fit_font(zone: dict, num: str) -> Tuple[ImageFont.FreeTypeFont, int, int, int, int]:
+        radius = float(zone.get("label_radius", 0.0))
+        area = max(1, int(zone["area"]))
+        fs = max(8, min(28, int(14 * (area / 3000) ** 0.25)))
+        if radius > 0:
+            fs = min(fs, max(7, int(radius * 1.15)))
+        draw_probe = ImageDraw.Draw(img)
+        while fs > 6:
+            font = _get_font(fs)
+            bb = draw_probe.textbbox((0, 0), num, font=font)
+            tw_txt, th_txt = bb[2] - bb[0], bb[3] - bb[1]
+            pad = 3
+            rx = (tw_txt + pad * 2) / 2.0
+            ry = (th_txt + pad * 2) / 2.0
+            if radius <= 0 or max(rx, ry) <= radius * 0.82:
+                return font, fs, tw_txt, th_txt, pad
+            fs -= 1
+        font = _get_font(6)
+        bb = draw_probe.textbbox((0, 0), num, font=font)
+        return font, 6, bb[2] - bb[0], bb[3] - bb[1], 2
 
     # Draw numbers with Pillow
     if show_numbers:
         draw = ImageDraw.Draw(img)
         for zone in zones:
+            if zone.get("touches_border"):
+                continue
             ci = zone["color"]
-            cy, cx = zone["centroid"]
+            cy, cx = zone.get("label_pos", zone["centroid"])
             num = str(ci + 1)
-            area = zone["area"]
-
-            fs = max(8, min(28, int(14 * (area / 3000) ** 0.25)))
-            font = _get_font(fs)
-            bb = draw.textbbox((0, 0), num, font=font)
-            tw_txt, th_txt = bb[2] - bb[0], bb[3] - bb[1]
+            font, fs, tw_txt, th_txt, pad = _fit_font(zone, num)
 
             tx = cx - tw_txt // 2
             ty = cy - th_txt // 2
 
-            pad = 3
             draw.ellipse(
                 [tx - pad, ty - pad, tx + tw_txt + pad, ty + th_txt + pad],
                 fill=(255, 255, 255), outline=(200, 200, 200),
