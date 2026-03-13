@@ -55,7 +55,7 @@ import api_keys as api_keys_module
 
 from mosaic_engine import (
     generate, generate_voronoi, generate_cbn, generate_line_art, generate_pbn,
-    generate_cbn_from_line_art, generate_smart_cbn, generate_from_preset, images_to_zip,
+    generate_smart_cbn, generate_from_preset, images_to_zip,
     PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, LineArtResult,
 )
 
@@ -696,27 +696,13 @@ async def generate_mosaic(
                     result = generate_cbn(img, colors=colors, page=page, min_zone_pixels=150)
                     del img
                 else:
-                    try:
-                        line_art_img = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
-                        result = generate_cbn_from_line_art(
-                            img,
-                            line_art_img,
-                            colors=colors,
-                            page=page,
-                            blur=2,
-                            min_zone_pixels=150,
-                        )
-                        if result.zone_count <= 0:
-                            raise ValueError("No closed zones from AI line art")
-                        del line_art_img
-                    except Exception:
-                        result = generate_pbn(
-                            img,
-                            colors=min(colors, 8),
-                            page=page,
-                            blur=8,
-                            min_zone_pixels=2500,
-                        )
+                    result = generate_pbn(
+                        img,
+                        colors=min(colors, 8),
+                        page=page,
+                        blur=8,
+                        min_zone_pixels=2500,
+                    )
                     del img
             else:
                 line_art = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
