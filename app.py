@@ -11,6 +11,7 @@ Endpoints:
     GET  /api/presets           — list available presets
     GET  /api/quota             — check remaining free uses
     POST /api/auth/signup       — create account
+    POST /api/auth/google       — sign in / sign up with Google
     POST /api/auth/login        — sign in
     POST /api/auth/refresh      — refresh JWT
     POST /api/auth/logout       — invalidate refresh token
@@ -55,7 +56,7 @@ import api_keys as api_keys_module
 
 from mosaic_engine import (
     generate, generate_voronoi, generate_cbn, generate_line_art, generate_pbn,
-    generate_smart_cbn, generate_from_preset, images_to_zip,
+    generate_cbn_from_line_art, generate_smart_cbn, generate_from_preset, images_to_zip,
     PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, LineArtResult,
 )
 
@@ -97,6 +98,7 @@ app.add_middleware(
         "http://localhost:8000",
         "http://127.0.0.1:8000",
         "http://localhost:3000",
+        "null",
     ],
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
@@ -215,6 +217,7 @@ def _read_image(data: bytes) -> Image.Image:
     if max(img.size) > MAX_DIM:
         img.thumbnail((MAX_DIM, MAX_DIM), Image.LANCZOS)
     return img
+
 
 def _looks_like_inked_artwork(img: Image.Image) -> bool:
     """Heuristic: distinguish clean artwork from photos/textured images."""
@@ -525,6 +528,7 @@ async def ai_image_generate(
     """
     # Quota check
     user_id, identifier = await get_user_or_ip(request)
+    promo = _check_promo(promo_code)
 
     if user_id:
         balance = await credits_module.get_balance(user_id)
@@ -539,9 +543,9 @@ async def ai_image_generate(
                 },
             )
     else:
-        if promo_code:
+        if promo:
             _apply_promo(request, promo_code)
-        remaining = _check_quota(request)
+        remaining = _check_quota(request, promo)
         if remaining <= 0:
             raise HTTPException(
                 status_code=429,
@@ -584,10 +588,11 @@ async def ai_image_generate(
     # Consume credits
     if user_id:
         await credits_module.consume_credits(user_id, cost, "generation", {"mode": "ai-image", "style": style, "quality": quality})
-    else:
+    elif not promo:
         _consume(request, cost)
 
-    return _img_to_streaming(_add_watermark(ai_img), "ai-image.png")
+    img_out = _add_watermark(ai_img) if (not user_id and not promo) else ai_img
+    return _img_to_streaming(img_out, "ai-image.png")
 
 
 @app.post("/api/generate")
@@ -696,13 +701,27 @@ async def generate_mosaic(
                     result = generate_cbn(img, colors=colors, page=page, min_zone_pixels=150)
                     del img
                 else:
-                    result = generate_pbn(
-                        img,
-                        colors=min(colors, 8),
-                        page=page,
-                        blur=8,
-                        min_zone_pixels=2500,
-                    )
+                    try:
+                        line_art_img = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
+                        result = generate_cbn_from_line_art(
+                            img,
+                            line_art_img,
+                            colors=colors,
+                            page=page,
+                            blur=2,
+                            min_zone_pixels=150,
+                        )
+                        if result.zone_count <= 0:
+                            raise ValueError("No closed zones from AI line art")
+                        del line_art_img
+                    except Exception:
+                        result = generate_pbn(
+                            img,
+                            colors=min(colors, 8),
+                            page=page,
+                            blur=8,
+                            min_zone_pixels=2500,
+                        )
                     del img
             else:
                 line_art = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
@@ -1214,6 +1233,11 @@ class ResetRequest(BaseModel):
     token: str
     password: str
 
+class GoogleLoginRequest(BaseModel):
+    credential: str
+    ref: str = ""
+    lang: str = "en"
+
 class ConsumeRequest(BaseModel):
     feature: str
     variant: str = ""
@@ -1226,6 +1250,15 @@ async def api_signup(req: SignupRequest):
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+@app.post("/api/auth/google")
+async def api_google_login(req: GoogleLoginRequest):
+    try:
+        result = await auth_module.google_login(req.credential, req.ref, req.lang)
+        return result
+    except ValueError as e:
+        raise HTTPException(401, str(e))
 
 
 @app.post("/api/auth/login")
@@ -1515,8 +1548,8 @@ async def qr_create(request: Request, body: dict = Body(...)):
     if not target_url or not target_url.startswith("http"):
         raise HTTPException(400, "A valid URL is required")
 
-    # Consume 1 credit
-    ok, _bal = await credits_module.consume_credits(user_id, 1, "dynamic_qr", {"label": label})
+    # Consume 3 credits
+    ok, _bal = await credits_module.consume_credits(user_id, 3, "dynamic_qr", {"label": label})
     if not ok:
         raise HTTPException(402, "Not enough credits")
 
@@ -1748,6 +1781,238 @@ async def api_admin_stats(secret: str = "", days: int = 30):
         await db.close()
 
 
+@app.get("/api/admin/dashboard", response_class=HTMLResponse)
+async def api_admin_dashboard(secret: str = "", days: int = 30):
+    """Admin dashboard with readable HTML tables."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    stats = await api_admin_stats(secret=secret, days=days)
+    bm = stats["by_mode"]
+    bd = stats["by_day"]
+    tx = stats["recent_transactions"]
+
+    mode_rows = "".join(
+        f"<tr><td>{m['mode']}</td><td>{m['count']}</td><td>{m['credits']}</td>"
+        f"<td>{'$'+str(round(m['count']*0.17,2)) if m['mode'] in ('cbn','pbn','ai') else '-'}</td></tr>"
+        for m in bm
+    ) or "<tr><td colspan='4'>No data</td></tr>"
+
+    day_rows = "".join(
+        f"<tr><td>{d['date']}</td><td>{d['count']}</td><td>{d['credits']}</td></tr>"
+        for d in bd
+    ) or "<tr><td colspan='3'>No data</td></tr>"
+
+    tx_rows = "".join(
+        f"<tr><td>{t['time']}</td><td>{t['email']}</td><td>{t['credits']}</td><td>{t['reason']}</td>"
+        f"<td>{t['metadata']}</td></tr>"
+        for t in tx
+    ) or "<tr><td colspan='5'>No data</td></tr>"
+
+    html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Admin Dashboard</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 0; padding: 20px; background: #f5f5f5; color: #333; }}
+h1 {{ color: #6a1b9a; margin-bottom: 5px; }}
+.subtitle {{ color: #888; margin-bottom: 30px; }}
+.cards {{ display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 30px; }}
+.card {{ background: #fff; border-radius: 12px; padding: 20px 28px; box-shadow: 0 2px 8px rgba(0,0,0,.08); min-width: 180px; }}
+.card .value {{ font-size: 2em; font-weight: 700; color: #6a1b9a; }}
+.card .label {{ font-size: .85em; color: #888; margin-top: 4px; }}
+table {{ width: 100%; border-collapse: collapse; background: #fff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,.08); margin-bottom: 30px; }}
+th {{ background: #6a1b9a; color: #fff; padding: 12px 16px; text-align: left; font-weight: 600; }}
+td {{ padding: 10px 16px; border-bottom: 1px solid #eee; }}
+tr:last-child td {{ border-bottom: none; }}
+tr:hover td {{ background: #faf5ff; }}
+h2 {{ color: #6a1b9a; margin-top: 30px; }}
+.period {{ display: inline-block; background: #ede7f6; color: #6a1b9a; padding: 4px 12px; border-radius: 20px; font-size: .85em; margin-left: 10px; }}
+.period-btns {{ display: inline-flex; gap: 6px; margin-left: 16px; }}
+.period-btns a {{ display: inline-block; padding: 5px 14px; border-radius: 20px; font-size: .85em; text-decoration: none; font-weight: 600; }}
+.period-btns a.active {{ background: #6a1b9a; color: #fff; }}
+.period-btns a:not(.active) {{ background: #e0e0e0; color: #555; }}
+.period-btns a:not(.active):hover {{ background: #ce93d8; color: #fff; }}
+</style></head><body>
+<h1>Univers Studio — Admin Dashboard</h1>
+<p class="subtitle">Credit consumption & API cost overview
+<span class="period-btns">
+<a href="?secret={secret}&days=7" class="{'active' if days == 7 else ''}">7 days</a>
+<a href="?secret={secret}&days=30" class="{'active' if days == 30 else ''}">30 days</a>
+<a href="?secret={secret}&days=90" class="{'active' if days == 90 else ''}">90 days</a>
+</span></p>
+
+<div class="cards">
+  <div class="card"><div class="value">{stats['total_generations']}</div><div class="label">Generations</div></div>
+  <div class="card"><div class="value">{stats['total_credits_consumed']}</div><div class="label">Credits consumed</div></div>
+  <div class="card"><div class="value">{stats['estimated_api_cost']}</div><div class="label">Estimated API cost</div></div>
+</div>
+
+<h2>By Mode</h2>
+<table>
+<tr><th>Mode</th><th>Count</th><th>Credits</th><th>API Cost</th></tr>
+{mode_rows}
+</table>
+
+<h2>By Day</h2>
+<table>
+<tr><th>Date</th><th>Count</th><th>Credits</th></tr>
+{day_rows}
+</table>
+
+<h2>Recent Transactions (last 50)</h2>
+<table>
+<tr><th>Time</th><th>User</th><th>Credits</th><th>Reason</th><th>Details</th></tr>
+{tx_rows}
+</table>
+
+</body></html>"""
+    return HTMLResponse(content=html)
+
+
+# ── Affiliate codes ──────────────────────────────────────────────────────
+
+class AffiliateGenerateRequest(BaseModel):
+    secret: str
+    affiliate_name: str
+    affiliate_email: str
+    count: int = 10
+    prefix: str = ""
+
+
+@app.post("/api/admin/affiliate-codes")
+async def api_admin_generate_affiliate_codes(req: AffiliateGenerateRequest):
+    """Generate single-use affiliate codes for a partner. Requires admin secret."""
+    if req.secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    if req.count < 1 or req.count > 500:
+        raise HTTPException(400, "Count must be between 1 and 500")
+
+    import string, random
+    prefix = (req.prefix.strip().upper() or req.affiliate_name.strip().upper()[:4])
+    codes = []
+    db = await get_db()
+    try:
+        for _ in range(req.count):
+            # Generate short unique code: PREFIX-XXXXXX
+            suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            code = f"{prefix}-{suffix}"
+            try:
+                await db.execute(
+                    "INSERT INTO affiliate_codes (code, affiliate_name, affiliate_email) VALUES (?, ?, ?)",
+                    (code, req.affiliate_name.strip(), req.affiliate_email.strip().lower()),
+                )
+                codes.append(code)
+            except Exception:
+                # Collision — retry with different suffix
+                suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+                code = f"{prefix}-{suffix}"
+                await db.execute(
+                    "INSERT INTO affiliate_codes (code, affiliate_name, affiliate_email) VALUES (?, ?, ?)",
+                    (code, req.affiliate_name.strip(), req.affiliate_email.strip().lower()),
+                )
+                codes.append(code)
+        await db.commit()
+        return {"ok": True, "affiliate": req.affiliate_name, "codes": codes, "count": len(codes)}
+    finally:
+        await db.close()
+
+
+@app.get("/api/affiliate/check/{code}")
+async def api_affiliate_check(code: str):
+    """Check if an affiliate code is valid and unused. Public endpoint."""
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT code, affiliate_name, is_used FROM affiliate_codes WHERE code = ? COLLATE NOCASE",
+            (code.strip(),),
+        )
+        if not rows:
+            return {"valid": False, "reason": "Code not found"}
+        row = rows[0]
+        if row[2]:  # is_used
+            return {"valid": False, "reason": "Code already used"}
+        return {"valid": True, "affiliate": row[1]}
+    finally:
+        await db.close()
+
+
+@app.get("/api/admin/affiliate-codes/list")
+async def api_admin_list_affiliate_codes(secret: str = "", affiliate_email: str = ""):
+    """List affiliate codes, optionally filtered by affiliate email. Requires admin secret."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    db = await get_db()
+    try:
+        if affiliate_email:
+            rows = await db.execute_fetchall(
+                "SELECT code, affiliate_name, affiliate_email, is_used, used_by_email, "
+                "datetime(created_at, 'unixepoch') as created, datetime(used_at, 'unixepoch') as used "
+                "FROM affiliate_codes WHERE affiliate_email = ? COLLATE NOCASE ORDER BY created_at DESC",
+                (affiliate_email.strip().lower(),),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                "SELECT code, affiliate_name, affiliate_email, is_used, used_by_email, "
+                "datetime(created_at, 'unixepoch') as created, datetime(used_at, 'unixepoch') as used "
+                "FROM affiliate_codes ORDER BY created_at DESC LIMIT 200"
+            )
+        return {"codes": [
+            {"code": r[0], "affiliate": r[1], "email": r[2], "used": bool(r[3]),
+             "used_by": r[4], "created": r[5], "used_at": r[6]}
+            for r in rows
+        ]}
+    finally:
+        await db.close()
+
+
+# ── Book Translation ─────────────────────────────────────────────────
+
+@app.post("/api/translate-book")
+async def api_translate_book(
+    request: Request,
+    file: UploadFile = File(...),
+    language: str = Form(...),
+):
+    """Translate a book file (PPTX, PDF, EPUB) to target language."""
+    import translate as translate_module
+
+    user_id, identifier = await get_user_or_ip(request)
+
+    # Validate file type
+    ext = Path(file.filename).suffix.lower() if file.filename else ""
+    type_map = {".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                ".pdf": "application/pdf", ".epub": "application/epub+zip"}
+    if ext not in type_map:
+        raise HTTPException(400, f"Unsupported file type: {ext}. Use .pptx, .pdf, or .epub")
+
+    content_type = type_map[ext]
+
+    # Validate language
+    if language not in translate_module.LANGUAGES:
+        raise HTTPException(400, f"Unsupported language: {language}")
+
+    # Read file
+    data = await file.read()
+    if len(data) > 200_000_000:
+        raise HTTPException(400, "File too large (max 200 MB)")
+
+    # Translate (with semaphore to prevent OOM)
+    async with _gen_semaphore:
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, translate_module.translate_book, data, language, content_type
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Translation failed: {str(e)[:200]}")
+
+    # Return translated file
+    out_name = f"{Path(file.filename).stem}-{language}{ext}"
+    return StreamingResponse(
+        io.BytesIO(result),
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "2.2.0"}
+    return {"status": "ok", "version": "2.4.0"}
