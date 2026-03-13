@@ -1058,8 +1058,10 @@ def generate_cbn(
     if blur > 0:
         img = img.filter(ImageFilter.GaussianBlur(radius=blur))
 
-    # Flatten background: replace dominant border color with white
-    img = _flatten_background(img, subject_mask=source_mask)
+    # Only flatten detached/transparent surroundings. Full-frame artwork often
+    # uses the border color as a real background zone that should stay visible.
+    if source_mask is not None:
+        img = _flatten_background(img, subject_mask=source_mask)
 
     # Fit to page
     if page and page in PAGE_SIZES:
@@ -1122,7 +1124,7 @@ def generate_cbn(
 
     # Compartments come from the source drawing; color only splits substantial
     # interior islands so quantization never redraws the source geometry.
-    effective_min_zone_pixels = max(min_zone_pixels, 8000)
+    effective_min_zone_pixels = max(min_zone_pixels, 3000 if source_mask is None else 8000)
     allow_border_zones = source_mask is None
     zone_map, zones = _cbn_find_hybrid_zones(
         label_map,
