@@ -40,6 +40,7 @@ import urllib.request
 from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Body
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,8 +54,8 @@ import stripe_integration
 import api_keys as api_keys_module
 
 from mosaic_engine import (
-    generate, generate_voronoi, generate_cbn, generate_line_art,
-    generate_smart_cbn, generate_from_preset, images_to_zip,
+    generate, generate_voronoi, generate_cbn, generate_line_art, generate_pbn,
+    generate_cbn_from_line_art, generate_smart_cbn, generate_from_preset, images_to_zip,
     PRESETS, VORONOI_DENSITIES, MosaicResult, CBNResult, LineArtResult,
 )
 
@@ -215,6 +216,32 @@ def _read_image(data: bytes) -> Image.Image:
         img.thumbnail((MAX_DIM, MAX_DIM), Image.LANCZOS)
     return img
 
+def _looks_like_inked_artwork(img: Image.Image) -> bool:
+    """Heuristic: distinguish clean artwork from photos/textured images."""
+    rgba = img.convert("RGBA")
+    arr = np.asarray(rgba, dtype=np.uint8)
+    alpha = arr[:, :, 3]
+    has_real_alpha = alpha.max() > 0 and (alpha < 250).any()
+    if has_real_alpha:
+        subject = alpha >= 32
+        rgb = arr[:, :, :3][subject] if subject.any() else arr[:, :, :3].reshape(-1, 3)
+    else:
+        rgb = arr[:, :, :3].reshape(-1, 3)
+
+    if rgb.size == 0:
+        return True
+    if has_real_alpha:
+        return True
+
+    white_ratio = float(np.mean(np.all(rgb >= 245, axis=1)))
+    gray = np.dot(rgb.astype(np.float32), np.array([0.299, 0.587, 0.114], dtype=np.float32))
+    dark_ratio = float(np.mean(gray <= 60))
+    chroma = rgb.max(axis=1).astype(np.int16) - rgb.min(axis=1).astype(np.int16)
+    flat_ratio = float(np.mean(chroma <= 20))
+
+    is_photo_like = white_ratio < 0.05 and flat_ratio >= 0.50 and dark_ratio < 0.22
+    return not is_photo_like
+
 
 def _img_to_streaming(img: Image.Image, filename: str) -> StreamingResponse:
     buf = io.BytesIO()
@@ -320,7 +347,7 @@ def _add_watermark(img: Image.Image) -> Image.Image:
 import base64
 import httpx
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 
 
 async def _ai_coloring_page(image_data: bytes, hint: str = "", style: str = "kids") -> Image.Image:
@@ -665,10 +692,32 @@ async def generate_mosaic(
         colors = max(4, min(20, colors))
         async with _gen_semaphore:
             if mode == "cbn":
-                # Preserve the uploaded artwork geometry. The previous AI-regenerated
-                # line art changed features and only labeled one region per color.
-                result = generate_cbn(img, colors=colors, page=page, min_zone_pixels=150)
-                del img
+                if _looks_like_inked_artwork(img):
+                    result = generate_cbn(img, colors=colors, page=page, min_zone_pixels=150)
+                    del img
+                else:
+                    try:
+                        line_art_img = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
+                        result = generate_cbn_from_line_art(
+                            img,
+                            line_art_img,
+                            colors=colors,
+                            page=page,
+                            blur=2,
+                            min_zone_pixels=150,
+                        )
+                        if result.zone_count <= 0:
+                            raise ValueError("No closed zones from AI line art")
+                        del line_art_img
+                    except Exception:
+                        result = generate_pbn(
+                            img,
+                            colors=min(colors, 8),
+                            page=page,
+                            blur=8,
+                            min_zone_pixels=2500,
+                        )
+                    del img
             else:
                 line_art = await _ai_coloring_page(data, hint=hint.strip(), style=cbn_style)
                 result = generate_smart_cbn(img, line_art, colors=colors, page=page)

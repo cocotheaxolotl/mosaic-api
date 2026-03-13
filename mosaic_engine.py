@@ -1162,6 +1162,141 @@ def generate_cbn(
 
 # ── Smart Color by Number (GPT line art + original colors) ─────────────
 
+def generate_cbn_from_line_art(
+    original: Image.Image,
+    line_art: Image.Image,
+    colors: int = 10,
+    page: str = "letter",
+    landscape: bool = False,
+    crop: Optional[str] = None,
+    blur: int = 2,
+    min_zone_pixels: int = 500,
+) -> CBNResult:
+    """Generate CBN from an original image using separate line art geometry."""
+    from scipy import ndimage  # lazy import
+
+    source_img, source_mask = _prepare_image_and_mask(original)
+    img = source_img.copy()
+    outline_img = line_art.convert("RGB")
+
+    if crop:
+        parts = [float(x) for x in crop.split(",")]
+        if len(parts) == 4:
+            lp, tp, rp, bp = parts
+            w, h = img.size
+            box = (
+                int(w * lp / 100), int(h * tp / 100),
+                int(w * (100 - rp) / 100), int(h * (100 - bp) / 100),
+            )
+            img = img.crop(box)
+            outline_img = outline_img.crop(box)
+            if source_mask is not None:
+                source_mask = source_mask[
+                    int(h * tp / 100):int(h * (100 - bp) / 100),
+                    int(w * lp / 100):int(w * (100 - rp) / 100),
+                ]
+
+    if blur > 0:
+        img = img.filter(ImageFilter.GaussianBlur(radius=blur))
+
+    img = _flatten_background(img, subject_mask=source_mask)
+
+    if page and page in PAGE_SIZES:
+        pw, ph = PAGE_SIZES[page]
+        if landscape:
+            pw, ph = ph, pw
+        margin = 50
+        tw, th = pw - 2 * margin, ph - 2 * margin
+        s = min(tw / img.size[0], th / img.size[1])
+        new_size = (int(img.size[0] * s), int(img.size[1] * s))
+        img = img.resize(new_size, Image.LANCZOS)
+        outline_img = outline_img.resize(new_size, Image.LANCZOS)
+        if source_mask is not None:
+            source_mask = np.array(
+                Image.fromarray((source_mask.astype(np.uint8) * 255), "L").resize(new_size, Image.NEAREST)
+            ) > 0
+
+    w, h = img.size
+    outline_gray = np.array(outline_img.convert("L"))
+    raw_line_mask = outline_gray <= 210
+    if source_mask is not None:
+        raw_line_mask &= source_mask
+        base_fill_mask = source_mask & ~raw_line_mask
+    else:
+        base_fill_mask = ~raw_line_mask
+
+    line_mask = raw_line_mask
+    if raw_line_mask.any():
+        closed_line_mask = ndimage.binary_closing(raw_line_mask, structure=_disk_kernel(1))
+        if source_mask is not None:
+            closed_line_mask &= source_mask
+        fill_mask = (~closed_line_mask) & base_fill_mask
+        if source_mask is not None:
+            fill_mask &= source_mask
+    else:
+        fill_mask = base_fill_mask
+
+    quant_mask = fill_mask.copy()
+    if quant_mask.any():
+        eroded = ndimage.binary_erosion(quant_mask, structure=np.ones((3, 3), dtype=bool), iterations=2)
+        if eroded.any():
+            quant_mask = eroded
+
+    label_map, palette = _quantize(img, colors, mask=quant_mask)
+    label_map = label_map.copy()
+    label_map[~fill_mask] = -1
+    label_map[fill_mask & ~quant_mask] = -1
+    label_map = _expand_labels_into_mask(label_map, fill_mask)
+    label_map = _smooth_label_map(label_map, fill_mask, colors, iterations=2)
+
+    effective_min_zone_pixels = max(min_zone_pixels, 8000)
+    zone_map, zones = _cbn_find_hybrid_zones(
+        label_map,
+        palette,
+        fill_mask,
+        min_zone_pixels=effective_min_zone_pixels,
+        subzone_min_pixels=7000,
+        subzone_min_fill_ratio=0.10,
+        compact_subzone_min_pixels=1000,
+        compact_subzone_min_fill_ratio=0.60,
+        compact_subzone_min_radius=10.0,
+        subzone_min_radius=8.0,
+    )
+    zone_map, zones = _merge_sparse_zones(zone_map, zones)
+    zones = _pbn_extract_paths(zone_map, zones)
+
+    mystery_svg = _pbn_to_svg(zones, palette, w, h, show_colors=False, show_numbers=True)
+    answer_svg = _pbn_to_svg(zones, palette, w, h, show_colors=True, show_numbers=False)
+    mystery_png = _pbn_render_png(
+        zone_map, zones, palette, w, h,
+        show_colors=False, show_numbers=True,
+        extra_outline_mask=line_mask,
+        extra_outline_gray=outline_gray,
+    )
+    answer_png = _pbn_render_png(
+        zone_map, zones, palette, w, h,
+        show_colors=True, show_numbers=False,
+        extra_outline_mask=line_mask,
+        extra_outline_gray=outline_gray,
+    )
+    legend_png = _make_legend(palette, w)
+    mystery_full_png = _stack(mystery_png, legend_png)
+    pal_list = [tuple(int(c) for c in row) for row in palette]
+
+    gc.collect()
+    return CBNResult(
+        mystery_svg=mystery_svg,
+        mystery_png=mystery_png,
+        answer_svg=answer_svg,
+        answer_png=answer_png,
+        legend_png=legend_png,
+        mystery_full_png=mystery_full_png,
+        zone_count=len(zones),
+        color_count=colors,
+        palette=pal_list,
+    )
+
+
 def generate_smart_cbn(
     original: Image.Image,
     line_art: Image.Image,
