@@ -683,7 +683,11 @@ def _cbn_find_zones(
     return zone_map, zones
 
 
-def _rebuild_zones_from_zone_map(zone_map: np.ndarray, zone_colors: dict) -> list:
+def _rebuild_zones_from_zone_map(
+    zone_map: np.ndarray,
+    zone_colors: dict,
+    allow_border_labels: bool = False,
+) -> list:
     """Recompute zone metadata after zone_map edits/merges."""
     from scipy import ndimage  # lazy import
 
@@ -732,6 +736,7 @@ def _rebuild_zones_from_zone_map(zone_map: np.ndarray, zone_colors: dict) -> lis
             "label_radius": label_radius,
             "area": area,
             "touches_border": touches_border,
+            "numberable": allow_border_labels or not touches_border,
         })
     return zones
 
@@ -894,6 +899,7 @@ def _cbn_find_hybrid_zones(
     compact_subzone_min_fill_ratio: float = 0.60,
     compact_subzone_min_radius: float = 10.0,
     subzone_min_radius: float = 8.0,
+    allow_border_zones: bool = False,
 ) -> Tuple[np.ndarray, list]:
     """Split only meaningful color subzones inside closed source compartments.
 
@@ -927,7 +933,7 @@ def _cbn_find_hybrid_zones(
             (sl[1].start == 0 and compartment_mask[:, 0].any()) or
             (sl[1].stop == w and compartment_mask[:, -1].any())
         )
-        if touches_border:
+        if touches_border and not allow_border_zones:
             continue
 
         compartment_labels = label_map[sl][compartment_mask]
@@ -990,7 +996,11 @@ def _cbn_find_hybrid_zones(
 
         zone_map[sl][compartment_zones > 0] = compartment_zones[compartment_zones > 0]
 
-    zones = _rebuild_zones_from_zone_map(zone_map, zone_colors)
+    zones = _rebuild_zones_from_zone_map(
+        zone_map,
+        zone_colors,
+        allow_border_labels=allow_border_zones,
+    )
     return zone_map, zones
 
 
@@ -1261,6 +1271,7 @@ def generate_cbn_from_line_art(
         compact_subzone_min_fill_ratio=0.60,
         compact_subzone_min_radius=10.0,
         subzone_min_radius=8.0,
+        allow_border_zones=True,
     )
     zone_map, zones = _merge_sparse_zones(zone_map, zones)
     zones = _pbn_extract_paths(zone_map, zones)
@@ -1586,7 +1597,7 @@ def _pbn_to_svg(
     # Numbers layer (on top)
     if show_numbers:
         for zone in zones:
-            if zone.get("touches_border"):
+            if not zone.get("numberable", not zone.get("touches_border")):
                 continue
             ci = zone["color"]
             cy, cx = zone.get("label_pos", zone["centroid"])
@@ -1698,7 +1709,7 @@ def _pbn_render_png(
     if show_numbers:
         draw = ImageDraw.Draw(img)
         for zone in zones:
-            if zone.get("touches_border"):
+            if not zone.get("numberable", not zone.get("touches_border")):
                 continue
             ci = zone["color"]
             cy, cx = zone.get("label_pos", zone["centroid"])
