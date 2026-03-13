@@ -212,6 +212,71 @@ def _expand_labels_into_mask(label_map: np.ndarray, target_mask: np.ndarray, ite
     return out
 
 
+def _dominant_border_color(img: Image.Image) -> np.ndarray:
+    """Estimate the dominant border RGB color of an image."""
+    arr = np.array(img, dtype=np.float32)
+    h, w = arr.shape[:2]
+    band = 5
+    edges = np.concatenate([
+        arr[:band, :].reshape(-1, 3),
+        arr[h - band:, :].reshape(-1, 3),
+        arr[:, :band].reshape(-1, 3),
+        arr[:, w - band:].reshape(-1, 3),
+    ])
+
+    from sklearn.cluster import MiniBatchKMeans as _KM
+    n_clusters = min(3, len(edges))
+    km = _KM(n_clusters=n_clusters, random_state=0, n_init=1, batch_size=512)
+    km.fit(edges)
+    counts = np.bincount(km.labels_, minlength=n_clusters)
+    return km.cluster_centers_[counts.argmax()]
+
+
+def _estimate_subject_mask_from_border_color(img: Image.Image, tolerance: int = 45) -> Optional[np.ndarray]:
+    """Estimate a foreground subject mask for full-frame artwork.
+
+    Pixels sufficiently different from the dominant border color are treated as
+    foreground, then we keep the largest non-border connected component.
+    """
+    from scipy import ndimage  # lazy import
+
+    arr = np.array(img, dtype=np.float32)
+    dominant = _dominant_border_color(img)
+    dist = np.linalg.norm(arr - dominant, axis=2)
+    fg = dist >= tolerance
+    if not fg.any():
+        return None
+
+    fg = ndimage.binary_opening(fg, structure=np.ones((3, 3), dtype=bool))
+    fg = ndimage.binary_closing(fg, structure=np.ones((5, 5), dtype=bool))
+    labeled, n = ndimage.label(fg)
+    if n <= 0:
+        return None
+
+    sizes = np.bincount(labeled.ravel())
+    sizes[0] = 0
+    h, w = fg.shape
+    best_id = 0
+    best_size = 0
+    for rid in range(1, n + 1):
+        mask = labeled == rid
+        if not mask.any():
+            continue
+        touches_border = mask[0, :].any() or mask[-1, :].any() or mask[:, 0].any() or mask[:, -1].any()
+        size = int(mask.sum())
+        if not touches_border and size > best_size:
+            best_id = rid
+            best_size = size
+    if best_id <= 0:
+        best_id = int(np.argmax(sizes))
+        if best_id <= 0:
+            return None
+
+    subject = labeled == best_id
+    subject = ndimage.binary_dilation(subject, structure=np.ones((21, 21), dtype=bool), iterations=2)
+    return subject
+
+
 def _flatten_background(img: Image.Image, tolerance: int = 60, subject_mask: Optional[np.ndarray] = None) -> Image.Image:
     """Detect dominant border color and replace similar pixels with white.
 
@@ -220,24 +285,7 @@ def _flatten_background(img: Image.Image, tolerance: int = 60, subject_mask: Opt
     of that color with pure white.  Returns a new PIL Image.
     """
     arr = np.array(img, dtype=np.float32)
-    h, w = arr.shape[:2]
-    band = 5
-
-    # Collect border pixels (top, bottom, left, right bands)
-    edges = np.concatenate([
-        arr[:band, :].reshape(-1, 3),       # top
-        arr[h - band:, :].reshape(-1, 3),   # bottom
-        arr[:, :band].reshape(-1, 3),       # left
-        arr[:, w - band:].reshape(-1, 3),   # right
-    ])
-
-    # Find dominant border color via small KMeans (3 clusters)
-    from sklearn.cluster import MiniBatchKMeans as _KM
-    n_clusters = min(3, len(edges))
-    km = _KM(n_clusters=n_clusters, random_state=0, n_init=1, batch_size=512)
-    km.fit(edges)
-    counts = np.bincount(km.labels_, minlength=n_clusters)
-    dominant = km.cluster_centers_[counts.argmax()]
+    dominant = _dominant_border_color(img)
 
     # Skip if border is already close to white (no need to flatten)
     if np.linalg.norm(dominant - np.array([255, 255, 255])) < 30:
@@ -803,6 +851,70 @@ def _merge_sparse_zones(
     )
 
 
+def _merge_small_border_zones_by_color(
+    zone_map: np.ndarray,
+    zones: list,
+    max_area: int = 40000,
+    allow_border_labels: bool = False,
+) -> Tuple[np.ndarray, list]:
+    """Reduce noisy full-frame backgrounds by merging small border zones into
+    the strongest touching border zone of the same color.
+    """
+    from scipy import ndimage  # lazy import
+
+    if not zones:
+        return zone_map, zones
+
+    zone_map = zone_map.copy()
+    zone_colors = {z["id"]: z["color"] for z in zones}
+    border_targets = {}
+    for z in zones:
+        if z.get("touches_border"):
+            cid = z["color"]
+            best = border_targets.get(cid)
+            if best is None or z["area"] > best["area"]:
+                border_targets[cid] = z
+
+    if not border_targets:
+        return zone_map, zones
+
+    struct = np.ones((3, 3), dtype=bool)
+    for z in zones:
+        if not z.get("touches_border"):
+            continue
+        if z["area"] > max_area:
+            continue
+        target = border_targets.get(z["color"])
+        if target is None or target["id"] == z["id"]:
+            continue
+        mask = zone_map == z["id"]
+        if not mask.any():
+            continue
+        # Only merge if this border fragment is visually attached to the same-color
+        # border family once expanded a little.
+        touch = ndimage.binary_dilation(mask, structure=struct, iterations=6) & (zone_map == target["id"])
+        if not touch.any():
+            continue
+        zone_map[mask] = target["id"]
+
+    remaining_ids = sorted(int(v) for v in np.unique(zone_map) if v > 0)
+    if not remaining_ids:
+        return zone_map, []
+
+    remap = {old: new for new, old in enumerate(remaining_ids, start=1)}
+    new_map = np.zeros_like(zone_map)
+    new_colors = {}
+    for old, new in remap.items():
+        new_map[zone_map == old] = new
+        new_colors[new] = zone_colors[old]
+
+    return new_map, _rebuild_zones_from_zone_map(
+        new_map,
+        new_colors,
+        allow_border_labels=allow_border_labels,
+    )
+
+
 def _cbn_find_closed_line_regions(
     img: Image.Image,
     palette: np.ndarray,
@@ -1029,8 +1141,14 @@ def generate_cbn(
     from scipy import ndimage  # lazy import
 
     source_img, source_mask = _prepare_image_and_mask(img)
+    synthetic_subject_mask = False
     if source_mask is not None and bool(np.all(source_mask)):
         source_mask = None
+    if source_mask is None:
+        estimated_mask = _estimate_subject_mask_from_border_color(source_img)
+        if estimated_mask is not None and estimated_mask.any():
+            source_mask = estimated_mask
+            synthetic_subject_mask = True
     img = source_img.copy()
     outline_img = source_img.copy()
 
@@ -1060,7 +1178,7 @@ def generate_cbn(
 
     # Only flatten detached/transparent surroundings. Full-frame artwork often
     # uses the border color as a real background zone that should stay visible.
-    if source_mask is not None:
+    if source_mask is not None and not synthetic_subject_mask:
         img = _flatten_background(img, subject_mask=source_mask)
 
     # Fit to page
@@ -1140,6 +1258,13 @@ def generate_cbn(
         allow_border_zones=allow_border_zones,
     )
     zone_map, zones = _merge_sparse_zones(zone_map, zones, allow_border_labels=allow_border_zones)
+    if source_mask is None:
+        zone_map, zones = _merge_small_border_zones_by_color(
+            zone_map,
+            zones,
+            max_area=50000,
+            allow_border_labels=allow_border_zones,
+        )
     del label_map, source_img
 
     # Extract contours with Potrace (smooth Bezier curves)
