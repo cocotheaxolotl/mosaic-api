@@ -741,7 +741,11 @@ def _rebuild_zones_from_zone_map(
     return zones
 
 
-def _merge_sparse_zones(zone_map: np.ndarray, zones: list) -> Tuple[np.ndarray, list]:
+def _merge_sparse_zones(
+    zone_map: np.ndarray,
+    zones: list,
+    allow_border_labels: bool = False,
+) -> Tuple[np.ndarray, list]:
     """Merge thin/irregular artifact zones into the strongest adjacent zone."""
     from scipy import ndimage  # lazy import
 
@@ -792,7 +796,11 @@ def _merge_sparse_zones(zone_map: np.ndarray, zones: list) -> Tuple[np.ndarray, 
         new_map[zone_map == old] = new
         new_colors[new] = zone_colors[old]
 
-    return new_map, _rebuild_zones_from_zone_map(new_map, new_colors)
+    return new_map, _rebuild_zones_from_zone_map(
+        new_map,
+        new_colors,
+        allow_border_labels=allow_border_labels,
+    )
 
 
 def _cbn_find_closed_line_regions(
@@ -1021,6 +1029,8 @@ def generate_cbn(
     from scipy import ndimage  # lazy import
 
     source_img, source_mask = _prepare_image_and_mask(img)
+    if source_mask is not None and bool(np.all(source_mask)):
+        source_mask = None
     img = source_img.copy()
     outline_img = source_img.copy()
 
@@ -1113,6 +1123,7 @@ def generate_cbn(
     # Compartments come from the source drawing; color only splits substantial
     # interior islands so quantization never redraws the source geometry.
     effective_min_zone_pixels = max(min_zone_pixels, 8000)
+    allow_border_zones = source_mask is None
     zone_map, zones = _cbn_find_hybrid_zones(
         label_map,
         palette,
@@ -1124,8 +1135,9 @@ def generate_cbn(
         compact_subzone_min_fill_ratio=0.60,
         compact_subzone_min_radius=10.0,
         subzone_min_radius=8.0,
+        allow_border_zones=allow_border_zones,
     )
-    zone_map, zones = _merge_sparse_zones(zone_map, zones)
+    zone_map, zones = _merge_sparse_zones(zone_map, zones, allow_border_labels=allow_border_zones)
     del label_map, source_img
 
     # Extract contours with Potrace (smooth Bezier curves)
@@ -1273,7 +1285,7 @@ def generate_cbn_from_line_art(
         subzone_min_radius=8.0,
         allow_border_zones=True,
     )
-    zone_map, zones = _merge_sparse_zones(zone_map, zones)
+    zone_map, zones = _merge_sparse_zones(zone_map, zones, allow_border_labels=True)
     zones = _pbn_extract_paths(zone_map, zones)
 
     mystery_svg = _pbn_to_svg(zones, palette, w, h, show_colors=False, show_numbers=True)
