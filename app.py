@@ -1686,6 +1686,7 @@ async def qr_redirect(short_code: str):
 # ── Admin endpoints ───────────────────────────────────────────────────────
 
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "COCO-ADMIN-2026")
+AFFILIATE_NOTIFY_EMAIL = os.environ.get("AFFILIATE_NOTIFY_EMAIL", "4allsmilesllc@gmail.com")
 
 
 class AdminSetPlanRequest(BaseModel):
@@ -2076,6 +2077,60 @@ async def api_admin_mark_payout_paid(payout_id: int, secret: str = ""):
         return {"ok": True, "payout_id": payout_id}
     finally:
         await db.close()
+
+
+# ── Affiliate application ────────────────────────────────────────────
+
+class AffiliateApplyRequest(BaseModel):
+    name: str
+    email: str
+    phone: str = ""
+    website: str = ""
+    audience: str = ""
+    promotion: str = ""
+    lang: str = "en"
+
+
+@app.post("/api/affiliate/apply")
+async def api_affiliate_apply(req: AffiliateApplyRequest):
+    """Receive an affiliate application and forward it by email via Brevo."""
+    name = req.name.strip()[:100]
+    email = req.email.strip()[:200]
+    if not name or not email:
+        raise HTTPException(400, "Name and email are required.")
+
+    subject = f"New Affiliate Application – {name}"
+    html = f"""
+<h2>New Affiliate Application — Univers Studio</h2>
+<table cellpadding="6" style="border-collapse:collapse;font-family:sans-serif;font-size:14px">
+  <tr><td><b>Name</b></td><td>{name}</td></tr>
+  <tr><td><b>Email</b></td><td>{email}</td></tr>
+  <tr><td><b>Phone</b></td><td>{req.phone.strip()[:50] or '—'}</td></tr>
+  <tr><td><b>Website</b></td><td>{req.website.strip()[:300] or '—'}</td></tr>
+  <tr><td><b>Audience</b></td><td>{req.audience.strip()[:300] or '—'}</td></tr>
+  <tr><td><b>Promotion plan</b></td><td style="white-space:pre-wrap">{req.promotion.strip()[:1000] or '—'}</td></tr>
+</table>
+"""
+    payload = json.dumps({
+        "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+        "to": [{"email": AFFILIATE_NOTIFY_EMAIL}],
+        "replyTo": {"email": email, "name": name},
+        "subject": subject,
+        "htmlContent": html,
+    }).encode()
+
+    try:
+        api_req = urllib.request.Request(
+            "https://api.brevo.com/v3/smtp/email",
+            data=payload,
+            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(api_req, timeout=10)
+    except Exception as e:
+        raise HTTPException(500, f"Failed to send email: {e}")
+
+    return {"ok": True}
 
 
 # ── Book Translation ─────────────────────────────────────────────────
