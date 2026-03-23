@@ -21,28 +21,34 @@ PLANS = {
         "prices": {
             "monthly": os.environ.get("STRIPE_PRICE_CREATOR_MONTHLY", ""),
             "annual": os.environ.get("STRIPE_PRICE_CREATOR_ANNUAL", ""),
+            "monthly_eur": os.environ.get("STRIPE_PRICE_CREATOR_MONTHLY_EUR", ""),
+            "annual_eur": os.environ.get("STRIPE_PRICE_CREATOR_ANNUAL_EUR", ""),
         },
         "credits": 100,
         "label": "Creator",
-        "price_display": "$9.99",
+        "price_display": "$15",
     },
     "pro": {
         "prices": {
             "monthly": os.environ.get("STRIPE_PRICE_PRO_MONTHLY", ""),
             "annual": os.environ.get("STRIPE_PRICE_PRO_ANNUAL", ""),
+            "monthly_eur": os.environ.get("STRIPE_PRICE_PRO_MONTHLY_EUR", ""),
+            "annual_eur": os.environ.get("STRIPE_PRICE_PRO_ANNUAL_EUR", ""),
         },
         "credits": 400,
         "label": "Pro",
-        "price_display": "$24.99",
+        "price_display": "$39",
     },
     "studio": {
         "prices": {
             "monthly": os.environ.get("STRIPE_PRICE_STUDIO_MONTHLY", ""),
             "annual": os.environ.get("STRIPE_PRICE_STUDIO_ANNUAL", ""),
+            "monthly_eur": os.environ.get("STRIPE_PRICE_STUDIO_MONTHLY_EUR", ""),
+            "annual_eur": os.environ.get("STRIPE_PRICE_STUDIO_ANNUAL_EUR", ""),
         },
         "credits": 1500,
         "label": "Studio",
-        "price_display": "$49.99",
+        "price_display": "$79",
     },
 }
 
@@ -50,12 +56,14 @@ PLANS = {
 CREDIT_PACKS = {
     "pack_20": {
         "price_id": os.environ.get("STRIPE_PRICE_PACK_20", ""),
+        "price_id_eur": os.environ.get("STRIPE_PRICE_PACK_20_EUR", ""),
         "credits": 20,
         "label": "20 Extra Credits",
         "price_display": "$4.99",
     },
     "pack_100": {
         "price_id": os.environ.get("STRIPE_PRICE_PACK_100", ""),
+        "price_id_eur": os.environ.get("STRIPE_PRICE_PACK_100_EUR", ""),
         "credits": 100,
         "label": "100 Extra Credits",
         "price_display": "$19.99",
@@ -111,11 +119,12 @@ async def _get_or_create_customer(user_id: int, email: str) -> str:
 
 
 async def create_checkout_session(
-    user_id: int, email: str, plan_key: str, billing: str = "monthly", ref: str = ""
+    user_id: int, email: str, plan_key: str, billing: str = "monthly", ref: str = "", currency: str = "usd"
 ) -> str:
     """Create a Stripe Checkout session. Returns the checkout URL.
     plan_key: 'creator' | 'pro' | 'studio' | 'pack_20' | 'pack_100'
     billing: 'monthly' | 'annual' (ignored for credit packs)
+    currency: 'usd' | 'eur'
     """
     customer_id = await _get_or_create_customer(user_id, email)
     affiliate_ref = ref.strip().lower() if ref else ""
@@ -132,11 +141,12 @@ async def create_checkout_session(
     # Credit pack — one-time payment
     if plan_key in CREDIT_PACKS:
         pack = CREDIT_PACKS[plan_key]
-        if not pack["price_id"]:
+        price_id = pack["price_id_eur"] if currency == "eur" and pack.get("price_id_eur") else pack["price_id"]
+        if not price_id:
             raise ValueError(f"Stripe price not configured for pack: {plan_key}")
         session = stripe.checkout.Session.create(
             customer=customer_id,
-            line_items=[{"price": pack["price_id"], "quantity": 1}],
+            line_items=[{"price": price_id, "quantity": 1}],
             mode="payment",
             allow_promotion_codes=True,
             success_url=f"{SITE_URL}/pricing/?success=true&session_id={{CHECKOUT_SESSION_ID}}",
@@ -157,7 +167,8 @@ async def create_checkout_session(
     plan = PLANS[plan_key]
     if billing not in ("monthly", "annual"):
         billing = "monthly"
-    price_id = plan["prices"].get(billing, "")
+    billing_key = f"{billing}_eur" if currency == "eur" else billing
+    price_id = plan["prices"].get(billing_key) or plan["prices"].get(billing, "")
     if not price_id:
         raise ValueError(f"Stripe price not configured for {plan_key}/{billing}")
 
@@ -208,6 +219,89 @@ async def _find_user_by_customer(customer_id: str) -> int | None:
         await db.close()
 
 
+async def _record_affiliate_commission(affiliate_code: str, customer_id: str, subscription_id: str | None, plan: str):
+    """Mark affiliate code as used and create commission record (called once per new subscription)."""
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT id, affiliate_name, affiliate_email, is_used FROM affiliate_codes WHERE code = ? COLLATE NOCASE",
+            (affiliate_code,),
+        )
+        if not rows:
+            return  # not a known affiliate code, ignore
+        row = rows[0]
+        if row[3]:  # is_used
+            return  # code already consumed
+
+        # Mark code as used
+        import time as _time
+        await db.execute(
+            "UPDATE affiliate_codes SET is_used = 1, used_at = ? WHERE id = ?",
+            (_time.time(), row[0]),
+        )
+        # Create commission record
+        await db.execute(
+            """INSERT INTO affiliate_commissions
+               (affiliate_email, affiliate_name, affiliate_code, customer_id, subscription_id, plan)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (row[2], row[1], affiliate_code, customer_id, subscription_id, plan),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def _record_affiliate_payout(customer_id: str, amount_cents: int, invoice_id: str | None):
+    """If an active commission exists for this customer and within 6 months, record a 30% payout."""
+    import time as _time
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """SELECT id, affiliate_email, commission_rate, months_total, months_paid, started_at
+               FROM affiliate_commissions
+               WHERE customer_id = ? AND status = 'active'""",
+            (customer_id,),
+        )
+        if not rows:
+            return
+        comm = rows[0]
+        comm_id, aff_email, rate, months_total, months_paid, started_at = comm
+
+        # Check we haven't exceeded months_total
+        if months_paid >= months_total:
+            await db.execute(
+                "UPDATE affiliate_commissions SET status = 'completed' WHERE id = ?", (comm_id,)
+            )
+            await db.commit()
+            return
+
+        # Also check 6-month wall-clock guard
+        months_elapsed = (_time.time() - started_at) / (30 * 86400)
+        if months_elapsed > months_total + 1:
+            await db.execute(
+                "UPDATE affiliate_commissions SET status = 'completed' WHERE id = ?", (comm_id,)
+            )
+            await db.commit()
+            return
+
+        amount_usd = round(amount_cents / 100 * rate, 2)
+        new_months_paid = months_paid + 1
+
+        await db.execute(
+            """INSERT INTO affiliate_payouts
+               (affiliate_email, commission_id, month_number, amount_usd, invoice_id)
+               VALUES (?, ?, ?, ?, ?)""",
+            (aff_email, comm_id, new_months_paid, amount_usd, invoice_id),
+        )
+        await db.execute(
+            "UPDATE affiliate_commissions SET months_paid = ?, status = ? WHERE id = ?",
+            (new_months_paid, 'completed' if new_months_paid >= months_total else 'active', comm_id),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
 async def handle_webhook(payload: bytes, sig_header: str) -> dict:
     """Process a Stripe webhook event. Returns a status dict."""
     try:
@@ -241,6 +335,7 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
             user_id = int(user_id_str)
             plan = PLANS[plan_key]
             sub_id = data.get("subscription")
+            affiliate_ref = (data.get("metadata", {}).get("affiliate_ref") or "").strip().lower()
 
             # Update user's Stripe customer ID if needed
             db = await get_db()
@@ -261,6 +356,16 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
                 stripe_sub_id=sub_id,
                 sub_status="active",
             )
+
+            # Record affiliate commission if a valid code was used
+            if affiliate_ref:
+                await _record_affiliate_commission(
+                    affiliate_code=affiliate_ref,
+                    customer_id=customer_id,
+                    subscription_id=sub_id,
+                    plan=plan_key,
+                )
+
             return {"handled": True, "action": "subscription_started", "plan": plan_key}
 
     elif event_type == "invoice.paid":
@@ -273,6 +378,10 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
                 billing_reason = data.get("billing_reason")
                 if billing_reason == "subscription_cycle":
                     await credits_module.renew_credits(user_id)
+                    # Record affiliate payout if there is an active commission
+                    amount_paid = data.get("amount_paid", 0)  # in cents
+                    invoice_id = data.get("id")
+                    await _record_affiliate_payout(customer_id, amount_paid, invoice_id)
                     return {"handled": True, "action": "credits_renewed"}
 
     elif event_type == "customer.subscription.updated":

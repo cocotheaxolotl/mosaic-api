@@ -78,6 +78,50 @@ CREATE TABLE IF NOT EXISTS dynamic_qrcodes (
 );
 CREATE INDEX IF NOT EXISTS idx_qr_user ON dynamic_qrcodes(user_id);
 CREATE INDEX IF NOT EXISTS idx_qr_short ON dynamic_qrcodes(short_code);
+
+CREATE TABLE IF NOT EXISTS affiliate_codes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    code            TEXT UNIQUE NOT NULL COLLATE NOCASE,
+    affiliate_name  TEXT NOT NULL,
+    affiliate_email TEXT NOT NULL COLLATE NOCASE,
+    is_used         INTEGER DEFAULT 0,
+    used_by_email   TEXT DEFAULT NULL,
+    used_at         REAL DEFAULT NULL,
+    created_at      REAL NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_aff_code ON affiliate_codes(code);
+CREATE INDEX IF NOT EXISTS idx_aff_email ON affiliate_codes(affiliate_email);
+
+CREATE TABLE IF NOT EXISTS affiliate_commissions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    affiliate_email TEXT NOT NULL COLLATE NOCASE,
+    affiliate_name  TEXT NOT NULL,
+    affiliate_code  TEXT NOT NULL,
+    customer_id     TEXT NOT NULL,
+    subscription_id TEXT,
+    plan            TEXT NOT NULL DEFAULT '',
+    started_at      REAL NOT NULL DEFAULT (unixepoch()),
+    commission_rate REAL NOT NULL DEFAULT 0.30,
+    months_total    INTEGER NOT NULL DEFAULT 6,
+    months_paid     INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'active'
+);
+CREATE INDEX IF NOT EXISTS idx_aff_comm_email ON affiliate_commissions(affiliate_email);
+CREATE INDEX IF NOT EXISTS idx_aff_comm_customer ON affiliate_commissions(customer_id);
+
+CREATE TABLE IF NOT EXISTS affiliate_payouts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    affiliate_email TEXT NOT NULL COLLATE NOCASE,
+    commission_id   INTEGER REFERENCES affiliate_commissions(id),
+    month_number    INTEGER NOT NULL,
+    amount_usd      REAL NOT NULL,
+    invoice_id      TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    created_at      REAL NOT NULL DEFAULT (unixepoch()),
+    paid_at         REAL
+);
+CREATE INDEX IF NOT EXISTS idx_aff_pay_email ON affiliate_payouts(affiliate_email);
+CREATE INDEX IF NOT EXISTS idx_aff_pay_status ON affiliate_payouts(status);
 """
 
 
@@ -101,6 +145,8 @@ async def init_db():
             await db.execute("ALTER TABLE users ADD COLUMN affiliate_ref TEXT DEFAULT NULL")
         except Exception:
             pass  # column already exists
+        # Migration: affiliate_commissions and affiliate_payouts may not exist on old DBs
+        # (handled by CREATE TABLE IF NOT EXISTS in SCHEMA_SQL above)
         await db.commit()
     finally:
         await db.close()

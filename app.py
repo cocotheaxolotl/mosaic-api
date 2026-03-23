@@ -1340,12 +1340,30 @@ async def api_credits_history(request: Request):
     return {"transactions": history}
 
 
+FREE_FEATURE_LIMIT = 3  # uses per tool for free plan
+
 @app.post("/api/credits/consume")
 async def api_credits_consume(request: Request, req: ConsumeRequest):
-    """Consume 1 credit for a feature (name generators, etc.)."""
+    """Consume 1 credit for a feature. Free plan: 3 uses per tool. Paid: deduct from balance."""
     user_id, _ = await get_user_or_ip(request)
     if not user_id:
         raise HTTPException(401, "Not authenticated")
+
+    plan_info = await credits_module.get_plan_info(user_id)
+    plan_name = (plan_info or {}).get("plan_name", "free")
+
+    if plan_name == "free":
+        feature = req.feature or "tool-download"
+        used = await credits_module.count_feature_usage(user_id, feature)
+        if used >= FREE_FEATURE_LIMIT:
+            raise HTTPException(402, {
+                "error": "Free limit reached",
+                "remaining": 0,
+                "upgrade_url": "https://univers.studio/pricing/",
+            })
+        await credits_module.record_feature_usage(user_id, feature, req.variant or "")
+        return {"ok": True, "remaining": FREE_FEATURE_LIMIT - used - 1}
+
     success, remaining = await credits_module.consume_credits(
         user_id, 1, "generation",
         metadata={"feature": req.feature, "variant": req.variant},
@@ -1354,7 +1372,7 @@ async def api_credits_consume(request: Request, req: ConsumeRequest):
         raise HTTPException(402, {
             "error": "Insufficient credits",
             "remaining": remaining,
-            "upgrade_url": "https://cocotheaxolotl.org/pricing/",
+            "upgrade_url": "https://univers.studio/pricing/",
         })
     return {"ok": True, "remaining": remaining}
 
@@ -1365,6 +1383,7 @@ class CheckoutRequest(BaseModel):
     plan: str  # "creator" | "pro" | "studio" | "pack_20" | "pack_100"
     billing: str = "monthly"  # "monthly" | "annual" (ignored for packs)
     ref: str = ""
+    currency: str = "usd"  # "usd" | "eur"
 
 
 @app.get("/api/billing/plans")
@@ -1384,7 +1403,7 @@ async def api_billing_checkout(request: Request, req: CheckoutRequest):
         raise HTTPException(404, "User not found")
     try:
         url = await stripe_integration.create_checkout_session(
-            user_id, profile["email"], req.plan, req.billing, req.ref
+            user_id, profile["email"], req.plan, req.billing, req.ref, req.currency
         )
         return {"url": url}
     except ValueError as e:
@@ -1959,6 +1978,102 @@ async def api_admin_list_affiliate_codes(secret: str = "", affiliate_email: str 
              "used_by": r[4], "created": r[5], "used_at": r[6]}
             for r in rows
         ]}
+    finally:
+        await db.close()
+
+
+@app.get("/api/admin/affiliate-commissions")
+async def api_admin_affiliate_commissions(secret: str = "", affiliate_email: str = ""):
+    """List affiliate commissions. Requires admin secret."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    db = await get_db()
+    try:
+        if affiliate_email:
+            rows = await db.execute_fetchall(
+                """SELECT id, affiliate_email, affiliate_name, affiliate_code, customer_id,
+                   subscription_id, plan, datetime(started_at,'unixepoch') as started,
+                   commission_rate, months_total, months_paid, status
+                   FROM affiliate_commissions WHERE affiliate_email = ? COLLATE NOCASE
+                   ORDER BY started_at DESC""",
+                (affiliate_email.strip().lower(),),
+            )
+        else:
+            rows = await db.execute_fetchall(
+                """SELECT id, affiliate_email, affiliate_name, affiliate_code, customer_id,
+                   subscription_id, plan, datetime(started_at,'unixepoch') as started,
+                   commission_rate, months_total, months_paid, status
+                   FROM affiliate_commissions ORDER BY started_at DESC LIMIT 200"""
+            )
+        return {"commissions": [
+            {"id": r[0], "affiliate_email": r[1], "affiliate_name": r[2], "code": r[3],
+             "customer_id": r[4], "subscription_id": r[5], "plan": r[6], "started": r[7],
+             "rate": r[8], "months_total": r[9], "months_paid": r[10], "status": r[11]}
+            for r in rows
+        ]}
+    finally:
+        await db.close()
+
+
+@app.get("/api/admin/affiliate-payouts")
+async def api_admin_affiliate_payouts(secret: str = "", affiliate_email: str = "", status: str = ""):
+    """List affiliate payouts. Requires admin secret."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    db = await get_db()
+    try:
+        conditions = []
+        params = []
+        if affiliate_email:
+            conditions.append("p.affiliate_email = ? COLLATE NOCASE")
+            params.append(affiliate_email.strip().lower())
+        if status in ("pending", "paid"):
+            conditions.append("p.status = ?")
+            params.append(status)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        rows = await db.execute_fetchall(
+            f"""SELECT p.id, p.affiliate_email, p.commission_id, p.month_number,
+               p.amount_usd, p.invoice_id, p.status,
+               datetime(p.created_at,'unixepoch') as created,
+               datetime(p.paid_at,'unixepoch') as paid,
+               c.affiliate_name
+               FROM affiliate_payouts p
+               LEFT JOIN affiliate_commissions c ON c.id = p.commission_id
+               {where}
+               ORDER BY p.created_at DESC LIMIT 500""",
+            params,
+        )
+        return {"payouts": [
+            {"id": r[0], "affiliate_email": r[1], "commission_id": r[2], "month": r[3],
+             "amount_usd": r[4], "invoice_id": r[5], "status": r[6], "created": r[7],
+             "paid_at": r[8], "affiliate_name": r[9]}
+            for r in rows
+        ]}
+    finally:
+        await db.close()
+
+
+@app.post("/api/admin/affiliate-payouts/{payout_id}/mark-paid")
+async def api_admin_mark_payout_paid(payout_id: int, secret: str = ""):
+    """Mark a payout as paid. Requires admin secret."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    import time as _time
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT id, status FROM affiliate_payouts WHERE id = ?", (payout_id,)
+        )
+        if not rows:
+            raise HTTPException(404, "Payout not found")
+        if rows[0][1] == "paid":
+            return {"ok": True, "message": "Already marked as paid"}
+        await db.execute(
+            "UPDATE affiliate_payouts SET status = 'paid', paid_at = ? WHERE id = ?",
+            (_time.time(), payout_id),
+        )
+        await db.commit()
+        return {"ok": True, "payout_id": payout_id}
     finally:
         await db.close()
 
