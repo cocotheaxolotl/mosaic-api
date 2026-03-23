@@ -1952,7 +1952,7 @@ async def api_admin_affiliates(secret: str = ""):
             <td style="text-align:right;color:#d97706">{fmt(r[5])}</td>
             <td style="text-align:right;color:#6b7280">{fmt(r[6])}</td>
             <td style="text-align:center">{r[8]}/{r[7]} mois</td>
-            <td><span style="background:{'#dcfce7' if r[9]=='completed' else '#fef3c7'};padding:2px 8px;border-radius:4px;font-size:.8em">{r[9]}</span></td>
+            <td><span style="background:{'#16a34a' if r[9]=='completed' else '#d97706'};color:#fff;padding:3px 10px;border-radius:4px;font-size:.8em;font-weight:600">{r[9]}</span></td>
         </tr>"""
     if not summary_rows:
         summary_rows = "<tr><td colspan='8' style='text-align:center;color:#9ca3af'>Aucune commission pour l'instant</td></tr>"
@@ -1973,9 +1973,12 @@ async def api_admin_affiliates(secret: str = ""):
 
     app_rows = ""
     for r in apps:
-        status_color = "#dcfce7" if r[6]=="approved" else "#fef3c7"
-        approve_btn = f' <a href="/api/admin/affiliate-applications/{r[0]}/approve?secret={secret}" style="background:#7c3aed;color:#fff;padding:3px 10px;border-radius:4px;text-decoration:none;font-size:.8em">Approuver</a>' if r[6]=="pending" else ""
-        app_rows += f"<tr><td>{r[1]}<br><small>{r[2]}</small></td><td><a href='{r[3]}'>{r[3]}</a></td><td>{r[4]}</td><td>{r[5]}</td><td><span style='background:{status_color};padding:2px 8px;border-radius:4px;font-size:.8em'>{r[6]}</span>{approve_btn}</td></tr>"
+        if r[6] == "approved":
+            badge = "<span style='background:#16a34a;color:#fff;padding:3px 10px;border-radius:4px;font-size:.8em;font-weight:600'>✓ approuvé</span>"
+        else:
+            badge = "<span style='background:#d97706;color:#fff;padding:3px 10px;border-radius:4px;font-size:.8em;font-weight:600'>en attente</span>"
+        approve_btn = f' <a href="/api/admin/affiliate-applications/{r[0]}/approve?secret={secret}" style="background:#7c3aed;color:#fff;padding:3px 10px;border-radius:4px;text-decoration:none;font-size:.8em;font-weight:600">Approuver →</a>' if r[6]=="pending" else ""
+        app_rows += f"<tr><td>{r[1]}<br><small style='color:#94a3b8'>{r[2]}</small></td><td><a href='{r[3]}'>{r[3]}</a></td><td>{r[4]}</td><td>{r[5]}</td><td>{badge}{approve_btn}</td></tr>"
     if not app_rows:
         app_rows = "<tr><td colspan='5' style='text-align:center;color:#9ca3af'>Aucune candidature</td></tr>"
 
