@@ -376,13 +376,16 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
             if user_id:
                 # Only renew if this is not the first invoice (checkout.session.completed handles that)
                 billing_reason = data.get("billing_reason")
+                amount_paid = data.get("amount_paid", 0)
+                invoice_id = data.get("id")
                 if billing_reason == "subscription_cycle":
                     await credits_module.renew_credits(user_id)
-                    # Record affiliate payout if there is an active commission
-                    amount_paid = data.get("amount_paid", 0)  # in cents
-                    invoice_id = data.get("id")
                     await _record_affiliate_payout(customer_id, amount_paid, invoice_id)
                     return {"handled": True, "action": "credits_renewed"}
+                elif billing_reason == "subscription_create":
+                    # First invoice — record month 1 commission payout
+                    await _record_affiliate_payout(customer_id, amount_paid, invoice_id)
+                    return {"handled": True, "action": "first_invoice_commission"}
 
     elif event_type == "customer.subscription.updated":
         customer_id = data.get("customer")
