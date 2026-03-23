@@ -2141,7 +2141,7 @@ async def api_affiliate_apply(req: AffiliateApplyRequest):
             "replyTo": {"email": email, "name": name},
             "subject": f"New Affiliate Application – {name}",
             "htmlContent": html,
-        }).encode()
+        }, ensure_ascii=False).encode("utf-8")
         api_req = urllib.request.Request(
             "https://api.brevo.com/v3/smtp/email",
             data=payload,
@@ -2247,7 +2247,7 @@ async def api_admin_approve_application(app_id: int, secret: str = ""):
             "to": [{"email": email, "name": name}],
             "subject": subject,
             "htmlContent": html_body,
-        }).encode()
+        }, ensure_ascii=False).encode("utf-8")
         api_req = urllib.request.Request(
             "https://api.brevo.com/v3/smtp/email",
             data=payload,
