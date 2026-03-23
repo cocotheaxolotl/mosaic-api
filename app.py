@@ -1887,6 +1887,138 @@ h2 {{ color: #6a1b9a; margin-top: 30px; }}
     return HTMLResponse(content=html)
 
 
+@app.get("/api/admin/affiliates", response_class=HTMLResponse)
+async def api_admin_affiliates(secret: str = ""):
+    """Affiliate dashboard — who brought whom, commissions owed."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+
+    db = await get_db()
+    try:
+        # Summary per affiliate
+        summary = await db.execute_fetchall("""
+            SELECT
+                ac.affiliate_email,
+                ac.affiliate_name,
+                ac.affiliate_code,
+                COUNT(DISTINCT ac.customer_id) AS customers,
+                SUM(ap.amount_usd) AS total_earned,
+                SUM(CASE WHEN ap.status='pending' THEN ap.amount_usd ELSE 0 END) AS pending,
+                SUM(CASE WHEN ap.status='paid' THEN ap.amount_usd ELSE 0 END) AS paid,
+                ac.months_total,
+                MIN(ac.months_paid) AS months_done,
+                ac.status AS comm_status
+            FROM affiliate_commissions ac
+            LEFT JOIN affiliate_payouts ap ON ap.commission_id = ac.id
+            GROUP BY ac.affiliate_email, ac.affiliate_code
+            ORDER BY total_earned DESC NULLS LAST
+        """)
+
+        # Detail: who subscribed via each code
+        customers = await db.execute_fetchall("""
+            SELECT
+                ac.affiliate_code,
+                ac.customer_id,
+                ac.plan,
+                datetime(ac.started_at,'unixepoch') AS started,
+                ac.months_paid,
+                ac.months_total,
+                ac.status,
+                COALESCE(SUM(ap.amount_usd),0) AS earned
+            FROM affiliate_commissions ac
+            LEFT JOIN affiliate_payouts ap ON ap.commission_id = ac.id
+            GROUP BY ac.id
+            ORDER BY ac.started_at DESC
+        """)
+
+        # Pending applications
+        apps = await db.execute_fetchall("""
+            SELECT id, name, email, website, audience, datetime(created_at,'unixepoch'), status
+            FROM affiliate_applications ORDER BY created_at DESC LIMIT 50
+        """)
+    finally:
+        await db.close()
+
+    def fmt(v):
+        return f"${v:.2f}" if v else "$0.00"
+
+    summary_rows = ""
+    for r in summary:
+        summary_rows += f"""<tr>
+            <td><b>{r[1]}</b><br><small>{r[0]}</small></td>
+            <td style="font-family:monospace;font-size:.9em">{r[2]}</td>
+            <td style="text-align:center">{r[3]}</td>
+            <td style="text-align:right;color:#16a34a"><b>{fmt(r[4])}</b></td>
+            <td style="text-align:right;color:#d97706">{fmt(r[5])}</td>
+            <td style="text-align:right;color:#6b7280">{fmt(r[6])}</td>
+            <td style="text-align:center">{r[8]}/{r[7]} mois</td>
+            <td><span style="background:{'#dcfce7' if r[9]=='completed' else '#fef3c7'};padding:2px 8px;border-radius:4px;font-size:.8em">{r[9]}</span></td>
+        </tr>"""
+    if not summary_rows:
+        summary_rows = "<tr><td colspan='8' style='text-align:center;color:#9ca3af'>Aucune commission pour l'instant</td></tr>"
+
+    # Group customers by code
+    cust_by_code = {}
+    for r in customers:
+        cust_by_code.setdefault(r[0], []).append(r)
+
+    cust_sections = ""
+    for code, rows in cust_by_code.items():
+        cust_sections += f"<h3 style='margin:24px 0 8px;font-size:.95em;color:#7c3aed'>Code : {code}</h3><table><tr><th>Customer ID</th><th>Plan</th><th>Début</th><th>Mois payés</th><th>Statut</th><th>Gagné</th></tr>"
+        for r in rows:
+            cust_sections += f"<tr><td style='font-size:.8em;font-family:monospace'>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td><td style='text-align:center'>{r[4]}/{r[5]}</td><td>{r[6]}</td><td style='color:#16a34a'>{fmt(r[7])}</td></tr>"
+        cust_sections += "</table>"
+    if not cust_sections:
+        cust_sections = "<p style='color:#9ca3af'>Aucun client apporté pour l'instant.</p>"
+
+    app_rows = ""
+    for r in apps:
+        status_color = "#dcfce7" if r[6]=="approved" else "#fef3c7"
+        approve_btn = f' <a href="/api/admin/affiliate-applications/{r[0]}/approve?secret={secret}" style="background:#7c3aed;color:#fff;padding:3px 10px;border-radius:4px;text-decoration:none;font-size:.8em">Approuver</a>' if r[6]=="pending" else ""
+        app_rows += f"<tr><td>{r[1]}<br><small>{r[2]}</small></td><td><a href='{r[3]}'>{r[3]}</a></td><td>{r[4]}</td><td>{r[5]}</td><td><span style='background:{status_color};padding:2px 8px;border-radius:4px;font-size:.8em'>{r[6]}</span>{approve_btn}</td></tr>"
+    if not app_rows:
+        app_rows = "<tr><td colspan='5' style='text-align:center;color:#9ca3af'>Aucune candidature</td></tr>"
+
+    html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<title>Affiliés — Admin</title>
+<style>
+body{{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;padding:32px;max-width:1100px;margin:0 auto}}
+h1{{color:#a78bfa;margin:0 0 8px}}
+h2{{color:#c4b5fd;margin:32px 0 12px;font-size:1.1em;text-transform:uppercase;letter-spacing:.05em}}
+h3{{color:#a78bfa}}
+table{{width:100%;border-collapse:collapse;margin:0 0 16px;font-size:.88em}}
+th{{background:#1e293b;padding:10px 12px;text-align:left;color:#94a3b8;font-weight:600;font-size:.78em;text-transform:uppercase}}
+td{{padding:10px 12px;border-bottom:1px solid #1e293b}}
+tr:hover td{{background:#1e293b}}
+a{{color:#a78bfa}}
+.nav{{margin:0 0 24px;font-size:.85em}}
+.nav a{{color:#64748b;margin-right:16px;text-decoration:none}}
+.nav a:hover{{color:#a78bfa}}
+</style></head><body>
+<h1>Programme Affiliés</h1>
+<div class="nav">
+  <a href="/api/admin/dashboard?secret={secret}">← Dashboard général</a>
+  <a href="/api/admin/affiliates?secret={secret}">↺ Rafraîchir</a>
+</div>
+
+<h2>Résumé par affilié</h2>
+<table>
+<tr><th>Affilié</th><th>Code</th><th>Clients</th><th>Total gagné</th><th>En attente</th><th>Versé</th><th>Avancement</th><th>Statut</th></tr>
+{summary_rows}
+</table>
+
+<h2>Clients apportés par code</h2>
+{cust_sections}
+
+<h2>Candidatures ({len(apps)})</h2>
+<table>
+<tr><th>Nom / Email</th><th>Site</th><th>Audience</th><th>Date</th><th>Statut</th></tr>
+{app_rows}
+</table>
+</body></html>"""
+    return HTMLResponse(content=html)
+
+
 # ── Affiliate codes ──────────────────────────────────────────────────────
 
 class AffiliateGenerateRequest(BaseModel):
