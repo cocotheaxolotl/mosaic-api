@@ -2222,10 +2222,18 @@ async def api_admin_approve_application(app_id: int, secret: str = ""):
         html_body = f"""
 <h2>Bienvenue dans le programme affilié Univers Studio !</h2>
 <p>Bonjour {name},</p>
-<p>Votre candidature a été acceptée. Voici votre code affilié personnel :</p>
-<p style="font-size:28px;font-weight:bold;letter-spacing:2px;color:#7c3aed;text-align:center;padding:20px;background:#f3f0ff;border-radius:8px">{code}</p>
-<p>Partagez ce code avec vos abonnés. Quand ils s'inscrivent sur <a href="https://univers.studio/pricing/">univers.studio/pricing/</a> avec ce code, vous touchez <strong>30% de commission</strong> sur leurs 6 premiers mois d'abonnement.</p>
-<p>Votre lien affilié : <a href="https://univers.studio/pricing/?ref={code}">https://univers.studio/pricing/?ref={code}</a></p>
+<p>Votre candidature a été acceptée. Voici votre lien affilié personnel — <strong>c'est ce lien que vous partagez avec votre audience</strong> :</p>
+<p style="text-align:center;margin:24px 0">
+  <a href="https://univers.studio/pricing/?ref={code}" style="background:#7c3aed;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:1.1em;font-family:sans-serif">
+    👉 https://univers.studio/pricing/?ref={code}
+  </a>
+</p>
+<p>Quand quelqu'un clique sur ce lien et souscrit un abonnement, le code <strong>{code}</strong> est automatiquement appliqué et vous touchez <strong>30% de commission</strong> sur ses 6 premiers mois.</p>
+<p style="background:#f3f0ff;padding:16px;border-radius:8px;font-size:.9em">
+  <strong>Comment partager ?</strong><br>
+  Copiez ce lien et partagez-le dans vos vidéos, articles, newsletters, réseaux sociaux — partout où vous conseillez des outils à votre audience.<br><br>
+  Vos abonnés n'ont rien à saisir : le code est appliqué automatiquement dès qu'ils arrivent sur la page via votre lien.
+</p>
 <p>Pour toute question : <a href="mailto:{AFFILIATE_NOTIFY_EMAIL}">{AFFILIATE_NOTIFY_EMAIL}</a></p>
 <p>Bonne chance !<br>L'équipe Univers Studio</p>
 """
@@ -2234,10 +2242,18 @@ async def api_admin_approve_application(app_id: int, secret: str = ""):
         html_body = f"""
 <h2>Welcome to the Univers Studio Affiliate Program!</h2>
 <p>Hi {name},</p>
-<p>Your application has been approved. Here is your personal affiliate code:</p>
-<p style="font-size:28px;font-weight:bold;letter-spacing:2px;color:#7c3aed;text-align:center;padding:20px;background:#f3f0ff;border-radius:8px">{code}</p>
-<p>Share this code with your audience. When they sign up at <a href="https://univers.studio/pricing/">univers.studio/pricing/</a> using your code, you earn <strong>30% commission</strong> on their first 6 months.</p>
-<p>Your affiliate link: <a href="https://univers.studio/pricing/?ref={code}">https://univers.studio/pricing/?ref={code}</a></p>
+<p>Your application has been approved. Here is your personal affiliate link — <strong>this is what you share with your audience</strong>:</p>
+<p style="text-align:center;margin:24px 0">
+  <a href="https://univers.studio/pricing/?ref={code}" style="background:#7c3aed;color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:1.1em;font-family:sans-serif">
+    👉 https://univers.studio/pricing/?ref={code}
+  </a>
+</p>
+<p>When someone clicks your link and subscribes, the code <strong>{code}</strong> is applied automatically and you earn <strong>30% commission</strong> on their first 6 months.</p>
+<p style="background:#f3f0ff;padding:16px;border-radius:8px;font-size:.9em">
+  <strong>How to share?</strong><br>
+  Copy this link and share it in your videos, blog posts, newsletters, social media — anywhere you recommend tools to your audience.<br><br>
+  Your followers don't need to type anything: the code is applied automatically as soon as they land on the page via your link.
+</p>
 <p>Questions? <a href="mailto:{AFFILIATE_NOTIFY_EMAIL}">{AFFILIATE_NOTIFY_EMAIL}</a></p>
 <p>Good luck!<br>The Univers Studio Team</p>
 """
