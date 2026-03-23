@@ -2093,33 +2093,161 @@ class AffiliateApplyRequest(BaseModel):
 
 @app.post("/api/affiliate/apply")
 async def api_affiliate_apply(req: AffiliateApplyRequest):
-    """Receive an affiliate application and forward it by email via Brevo."""
+    """Store affiliate application in DB and notify admin by email."""
     name = req.name.strip()[:100]
     email = req.email.strip()[:200]
     if not name or not email:
         raise HTTPException(400, "Name and email are required.")
 
-    subject = f"New Affiliate Application – {name}"
+    # Store in database
+    db = await get_db()
+    try:
+        await db.execute(
+            """INSERT INTO affiliate_applications (name, email, phone, website, audience, promotion, lang)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (name, email, req.phone.strip()[:50], req.website.strip()[:300],
+             req.audience.strip()[:300], req.promotion.strip()[:1000], req.lang or 'en'),
+        )
+        await db.commit()
+        rows = await db.execute_fetchall("SELECT last_insert_rowid()")
+        app_id = rows[0][0]
+    finally:
+        await db.close()
+
+    # Notify admin
+    approve_url = f"https://mosaic-api.fly.dev/api/admin/affiliate-applications/{app_id}/approve?secret={ADMIN_SECRET}"
     html = f"""
 <h2>New Affiliate Application — Univers Studio</h2>
 <table cellpadding="6" style="border-collapse:collapse;font-family:sans-serif;font-size:14px">
+  <tr><td><b>ID</b></td><td>#{app_id}</td></tr>
   <tr><td><b>Name</b></td><td>{name}</td></tr>
   <tr><td><b>Email</b></td><td>{email}</td></tr>
-  <tr><td><b>Phone</b></td><td>{req.phone.strip()[:50] or '—'}</td></tr>
-  <tr><td><b>Website</b></td><td>{req.website.strip()[:300] or '—'}</td></tr>
-  <tr><td><b>Audience</b></td><td>{req.audience.strip()[:300] or '—'}</td></tr>
-  <tr><td><b>Promotion plan</b></td><td style="white-space:pre-wrap">{req.promotion.strip()[:1000] or '—'}</td></tr>
+  <tr><td><b>Phone</b></td><td>{req.phone.strip() or '—'}</td></tr>
+  <tr><td><b>Website</b></td><td>{req.website.strip() or '—'}</td></tr>
+  <tr><td><b>Audience</b></td><td>{req.audience.strip() or '—'}</td></tr>
+  <tr><td><b>Promotion plan</b></td><td style="white-space:pre-wrap">{req.promotion.strip() or '—'}</td></tr>
 </table>
+<p style="margin-top:20px">
+  <a href="{approve_url}" style="background:#7c3aed;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;font-family:sans-serif">
+    ✅ Approve &amp; Send Code
+  </a>
+</p>
+<p style="font-size:12px;color:#666">Clicking approve will auto-generate an affiliate code and email it to {email}.</p>
 """
-    payload = json.dumps({
-        "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
-        "to": [{"email": AFFILIATE_NOTIFY_EMAIL}],
-        "replyTo": {"email": email, "name": name},
-        "subject": subject,
-        "htmlContent": html,
-    }).encode()
-
     try:
+        payload = json.dumps({
+            "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+            "to": [{"email": AFFILIATE_NOTIFY_EMAIL}],
+            "replyTo": {"email": email, "name": name},
+            "subject": f"New Affiliate Application – {name}",
+            "htmlContent": html,
+        }).encode()
+        api_req = urllib.request.Request(
+            "https://api.brevo.com/v3/smtp/email",
+            data=payload,
+            headers={"api-key": BREVO_API_KEY, "Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(api_req, timeout=10)
+    except Exception:
+        pass  # Don't fail if email fails — application is already stored
+
+    return {"ok": True}
+
+
+@app.get("/api/admin/affiliate-applications")
+async def api_admin_list_applications(secret: str = "", status: str = "pending"):
+    """List affiliate applications. Requires admin secret."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """SELECT id, name, email, phone, website, audience, promotion, lang, status,
+               datetime(created_at,'unixepoch') as created
+               FROM affiliate_applications WHERE status = ? ORDER BY created_at DESC""",
+            (status,),
+        )
+        return {"applications": [
+            {"id": r[0], "name": r[1], "email": r[2], "phone": r[3], "website": r[4],
+             "audience": r[5], "promotion": r[6], "lang": r[7], "status": r[8], "created": r[9]}
+            for r in rows
+        ]}
+    finally:
+        await db.close()
+
+
+@app.get("/api/admin/affiliate-applications/{app_id}/approve")
+async def api_admin_approve_application(app_id: int, secret: str = ""):
+    """Approve an affiliate application: generate a code and email it to the applicant."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT id, name, email, lang, status FROM affiliate_applications WHERE id = ?",
+            (app_id,),
+        )
+        if not rows:
+            raise HTTPException(404, "Application not found")
+        row = rows[0]
+        if row[4] == 'approved':
+            return HTMLResponse("<h2>Already approved.</h2>", status_code=200)
+
+        name, email, lang = row[1], row[2], row[3]
+
+        # Generate affiliate code
+        import string, random as _random
+        prefix = "".join(c for c in name.upper().split()[0][:6] if c.isalpha()) or "AFF"
+        suffix = "".join(_random.choices(string.ascii_uppercase + string.digits, k=6))
+        code = f"{prefix}-{suffix}"
+
+        # Insert code into affiliate_codes
+        await db.execute(
+            "INSERT INTO affiliate_codes (code, affiliate_name, affiliate_email) VALUES (?, ?, ?)",
+            (code, name, email.lower()),
+        )
+        await db.execute(
+            "UPDATE affiliate_applications SET status = 'approved' WHERE id = ?",
+            (app_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+    # Email the code to the applicant
+    if lang == 'fr':
+        subject = "Votre code affilié Univers Studio"
+        html_body = f"""
+<h2>Bienvenue dans le programme affilié Univers Studio !</h2>
+<p>Bonjour {name},</p>
+<p>Votre candidature a été acceptée. Voici votre code affilié personnel :</p>
+<p style="font-size:28px;font-weight:bold;letter-spacing:2px;color:#7c3aed;text-align:center;padding:20px;background:#f3f0ff;border-radius:8px">{code}</p>
+<p>Partagez ce code avec vos abonnés. Quand ils s'inscrivent sur <a href="https://univers.studio/pricing/">univers.studio/pricing/</a> avec ce code, vous touchez <strong>30% de commission</strong> sur leurs 6 premiers mois d'abonnement.</p>
+<p>Votre lien affilié : <a href="https://univers.studio/pricing/?ref={code}">https://univers.studio/pricing/?ref={code}</a></p>
+<p>Pour toute question : <a href="mailto:{AFFILIATE_NOTIFY_EMAIL}">{AFFILIATE_NOTIFY_EMAIL}</a></p>
+<p>Bonne chance !<br>L'équipe Univers Studio</p>
+"""
+    else:
+        subject = "Your Univers Studio Affiliate Code"
+        html_body = f"""
+<h2>Welcome to the Univers Studio Affiliate Program!</h2>
+<p>Hi {name},</p>
+<p>Your application has been approved. Here is your personal affiliate code:</p>
+<p style="font-size:28px;font-weight:bold;letter-spacing:2px;color:#7c3aed;text-align:center;padding:20px;background:#f3f0ff;border-radius:8px">{code}</p>
+<p>Share this code with your audience. When they sign up at <a href="https://univers.studio/pricing/">univers.studio/pricing/</a> using your code, you earn <strong>30% commission</strong> on their first 6 months.</p>
+<p>Your affiliate link: <a href="https://univers.studio/pricing/?ref={code}">https://univers.studio/pricing/?ref={code}</a></p>
+<p>Questions? <a href="mailto:{AFFILIATE_NOTIFY_EMAIL}">{AFFILIATE_NOTIFY_EMAIL}</a></p>
+<p>Good luck!<br>The Univers Studio Team</p>
+"""
+    try:
+        payload = json.dumps({
+            "sender": {"name": SENDER_NAME, "email": SENDER_EMAIL},
+            "to": [{"email": email, "name": name}],
+            "subject": subject,
+            "htmlContent": html_body,
+        }).encode()
         api_req = urllib.request.Request(
             "https://api.brevo.com/v3/smtp/email",
             data=payload,
@@ -2128,9 +2256,16 @@ async def api_affiliate_apply(req: AffiliateApplyRequest):
         )
         urllib.request.urlopen(api_req, timeout=10)
     except Exception as e:
-        raise HTTPException(500, f"Failed to send email: {e}")
+        raise HTTPException(500, f"Code generated ({code}) but failed to send email: {e}")
 
-    return {"ok": True}
+    return HTMLResponse(f"""
+<html><body style="font-family:sans-serif;padding:40px;max-width:500px;margin:0 auto">
+<h2 style="color:#16a34a">✅ Approved!</h2>
+<p><b>{name}</b> ({email}) has been approved.</p>
+<p>Affiliate code: <b style="color:#7c3aed;font-size:1.3em">{code}</b></p>
+<p>An email with the code has been sent to {email}.</p>
+</body></html>
+""")
 
 
 # ── Book Translation ─────────────────────────────────────────────────

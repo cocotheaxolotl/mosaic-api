@@ -92,6 +92,21 @@ CREATE TABLE IF NOT EXISTS affiliate_codes (
 CREATE INDEX IF NOT EXISTS idx_aff_code ON affiliate_codes(code);
 CREATE INDEX IF NOT EXISTS idx_aff_email ON affiliate_codes(affiliate_email);
 
+CREATE TABLE IF NOT EXISTS affiliate_applications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    email           TEXT NOT NULL COLLATE NOCASE,
+    phone           TEXT DEFAULT '',
+    website         TEXT DEFAULT '',
+    audience        TEXT DEFAULT '',
+    promotion       TEXT DEFAULT '',
+    lang            TEXT DEFAULT 'en',
+    status          TEXT NOT NULL DEFAULT 'pending',
+    created_at      REAL NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_aff_app_email ON affiliate_applications(email);
+CREATE INDEX IF NOT EXISTS idx_aff_app_status ON affiliate_applications(status);
+
 CREATE TABLE IF NOT EXISTS affiliate_commissions (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     affiliate_email TEXT NOT NULL COLLATE NOCASE,
