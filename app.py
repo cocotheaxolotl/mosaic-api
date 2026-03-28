@@ -2226,6 +2226,108 @@ class AffiliateApplyRequest(BaseModel):
     lang: str = "en"
 
 
+def _mask_email(email: str) -> str:
+    """Mask email: j****n@g***l.com"""
+    if not email or "@" not in email:
+        return "***"
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[0] + "***"
+    else:
+        masked_local = local[0] + "*" * (len(local) - 2) + local[-1]
+    parts = domain.rsplit(".", 1)
+    if len(parts) == 2:
+        d, ext = parts
+        if len(d) <= 2:
+            masked_domain = d[0] + "***." + ext
+        else:
+            masked_domain = d[0] + "*" * (len(d) - 2) + d[-1] + "." + ext
+        return masked_local + "@" + masked_domain
+    return masked_local + "@***"
+
+
+@app.get("/api/affiliate/my-referrals")
+async def api_affiliate_my_referrals(request: Request):
+    """Affiliate dashboard data — returns referrals with masked emails. Requires JWT auth."""
+    user_id, key = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Authentication required")
+
+    db = await get_db()
+    try:
+        # Get current user's email
+        user_rows = await db.execute_fetchall("SELECT email FROM users WHERE id = ?", (user_id,))
+        if not user_rows:
+            raise HTTPException(401, "User not found")
+        user_email = user_rows[0][0]
+
+        # Check if this user is an affiliate
+        code_rows = await db.execute_fetchall(
+            "SELECT code FROM affiliate_codes WHERE affiliate_email = ? COLLATE NOCASE LIMIT 1",
+            (user_email,),
+        )
+        if not code_rows:
+            return {"is_affiliate": False, "code": None, "referrals": [], "totals": {}}
+
+        affiliate_code = code_rows[0][0]
+
+        # Get commissions with customer emails (masked)
+        referrals_raw = await db.execute_fetchall("""
+            SELECT
+                ac.id,
+                u.email AS customer_email,
+                ac.plan,
+                datetime(ac.started_at, 'unixepoch') AS started,
+                ac.months_paid,
+                ac.months_total,
+                ac.status,
+                COALESCE(SUM(ap.amount_usd), 0) AS earned
+            FROM affiliate_commissions ac
+            LEFT JOIN users u ON u.stripe_customer_id = ac.customer_id
+            LEFT JOIN affiliate_payouts ap ON ap.commission_id = ac.id
+            WHERE ac.affiliate_code = ? COLLATE NOCASE
+            GROUP BY ac.id
+            ORDER BY ac.started_at DESC
+        """, (affiliate_code,))
+
+        referrals = []
+        total_earned = 0.0
+        total_pending = 0.0
+        for r in referrals_raw:
+            earned = r[7] or 0.0
+            total_earned += earned
+            referrals.append({
+                "email": _mask_email(r[1]) if r[1] else "—",
+                "plan": r[2],
+                "started": r[3],
+                "months_paid": r[4],
+                "months_total": r[5],
+                "status": r[6],
+                "earned": round(earned, 2),
+            })
+
+        # Pending payouts
+        payout_rows = await db.execute_fetchall("""
+            SELECT COALESCE(SUM(amount_usd), 0)
+            FROM affiliate_payouts
+            WHERE affiliate_email = ? COLLATE NOCASE AND status = 'pending'
+        """, (user_email,))
+        total_pending = payout_rows[0][0] if payout_rows else 0.0
+
+        return {
+            "is_affiliate": True,
+            "code": affiliate_code,
+            "referrals": referrals,
+            "totals": {
+                "customers": len(referrals),
+                "earned": round(total_earned, 2),
+                "pending": round(total_pending, 2),
+            },
+        }
+    finally:
+        await db.close()
+
+
 @app.post("/api/affiliate/apply")
 async def api_affiliate_apply(req: AffiliateApplyRequest):
     """Store affiliate application in DB and notify admin by email."""
