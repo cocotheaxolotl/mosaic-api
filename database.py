@@ -137,6 +137,20 @@ CREATE TABLE IF NOT EXISTS affiliate_payouts (
 );
 CREATE INDEX IF NOT EXISTS idx_aff_pay_email ON affiliate_payouts(affiliate_email);
 CREATE INDEX IF NOT EXISTS idx_aff_pay_status ON affiliate_payouts(status);
+
+CREATE TABLE IF NOT EXISTS trial_codes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    code            TEXT UNIQUE NOT NULL COLLATE NOCASE,
+    created_for     TEXT NOT NULL,
+    plan            TEXT NOT NULL DEFAULT 'studio',
+    credits         INTEGER NOT NULL DEFAULT 1200,
+    duration_days   INTEGER NOT NULL DEFAULT 30,
+    used_by         INTEGER REFERENCES users(id),
+    used_at         REAL,
+    expires_at      REAL,
+    created_at      REAL NOT NULL DEFAULT (unixepoch())
+);
+CREATE INDEX IF NOT EXISTS idx_trial_code ON trial_codes(code);
 """
 
 

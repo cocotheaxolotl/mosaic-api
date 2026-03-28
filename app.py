@@ -1290,6 +1290,30 @@ async def api_me(request: Request):
     user_id, identifier = await get_user_or_ip(request)
     if not user_id:
         raise HTTPException(401, "Not authenticated")
+
+    # Check for expired trial — auto-downgrade to free
+    import time as _time
+    db = await get_db()
+    try:
+        trial_rows = await db.execute_fetchall(
+            """SELECT tc.id FROM trial_codes tc
+               JOIN credits c ON c.user_id = tc.used_by
+               WHERE tc.used_by = ? AND tc.expires_at < ? AND c.sub_status = 'trial'""",
+            (user_id, _time.time()),
+        )
+        if trial_rows:
+            await db.execute(
+                "UPDATE credits SET plan_name = 'free', balance = 3, monthly_quota = 3, sub_status = 'none' WHERE user_id = ?",
+                (user_id,),
+            )
+            await db.execute(
+                "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, ?, ?)",
+                (user_id, 0, "trial_expired", "{}"),
+            )
+            await db.commit()
+    finally:
+        await db.close()
+
     profile = await auth_module.get_me(user_id)
     if not profile:
         raise HTTPException(404, "User not found")
@@ -1718,6 +1742,133 @@ async def api_admin_set_plan(req: AdminSetPlanRequest):
         )
         await db.commit()
         return {"ok": True, "email": req.email.strip().lower(), "plan": req.plan, "credits": req.credits}
+    finally:
+        await db.close()
+
+
+# ── Trial codes (1 month Studio for influencers) ─────────────────────────
+
+class TrialCodeGenerateRequest(BaseModel):
+    secret: str
+    name: str
+    plan: str = "studio"
+    credits: int = 1200
+    duration_days: int = 30
+    count: int = 1
+
+
+@app.post("/api/admin/trial-codes")
+async def api_admin_generate_trial_codes(req: TrialCodeGenerateRequest):
+    """Generate trial codes for a specific influencer. Requires admin secret."""
+    if req.secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    name = req.name.strip()[:100]
+    if not name:
+        raise HTTPException(400, "Name is required")
+
+    import secrets as _secrets
+    db = await get_db()
+    codes = []
+    try:
+        for _ in range(req.count):
+            prefix = name.split()[0].upper()[:5]
+            suffix = _secrets.token_hex(3).upper()
+            code = f"TRIAL-{prefix}-{suffix}"
+            await db.execute(
+                """INSERT INTO trial_codes (code, created_for, plan, credits, duration_days)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (code, name, req.plan, req.credits, req.duration_days),
+            )
+            codes.append(code)
+        await db.commit()
+    finally:
+        await db.close()
+    return {"ok": True, "codes": codes, "for": name, "plan": req.plan, "duration_days": req.duration_days}
+
+
+@app.get("/api/admin/trial-codes/list")
+async def api_admin_list_trial_codes(secret: str = ""):
+    """List all trial codes. Requires admin secret."""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(403, "Forbidden")
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """SELECT tc.code, tc.created_for, tc.plan, tc.credits, tc.duration_days,
+                      tc.used_by, u.email AS used_by_email,
+                      datetime(tc.used_at,'unixepoch') AS used_at,
+                      datetime(tc.expires_at,'unixepoch') AS expires_at,
+                      datetime(tc.created_at,'unixepoch') AS created_at
+               FROM trial_codes tc
+               LEFT JOIN users u ON u.id = tc.used_by
+               ORDER BY tc.created_at DESC"""
+        )
+        return {"codes": [
+            {"code": r[0], "for": r[1], "plan": r[2], "credits": r[3], "days": r[4],
+             "used_by": r[6], "used_at": r[7], "expires_at": r[8], "created_at": r[9]}
+            for r in rows
+        ]}
+    finally:
+        await db.close()
+
+
+class TrialRedeemRequest(BaseModel):
+    code: str
+
+
+@app.post("/api/trial/redeem")
+async def api_trial_redeem(req: TrialRedeemRequest, request: Request):
+    """Redeem a trial code. Requires JWT auth. Upgrades user to trial plan."""
+    user_id, key = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Authentication required")
+
+    code = req.code.strip().upper()
+    if not code:
+        raise HTTPException(400, "Code is required")
+
+    import time as _time
+    db = await get_db()
+    try:
+        # Check code exists and is unused
+        rows = await db.execute_fetchall(
+            "SELECT id, plan, credits, duration_days FROM trial_codes WHERE code = ? AND used_by IS NULL",
+            (code,),
+        )
+        if not rows:
+            raise HTTPException(400, "Invalid or already used code")
+
+        tc_id, plan, credits, duration_days = rows[0][0], rows[0][1], rows[0][2], rows[0][3]
+        now = _time.time()
+        expires_at = now + duration_days * 86400
+
+        # Check user doesn't already have an active paid subscription
+        credit_rows = await db.execute_fetchall(
+            "SELECT plan_name, sub_status FROM credits WHERE user_id = ?", (user_id,)
+        )
+        if credit_rows and credit_rows[0][1] == 'active' and credit_rows[0][0] != 'free':
+            raise HTTPException(400, "You already have an active subscription")
+
+        # Mark code as used
+        await db.execute(
+            "UPDATE trial_codes SET used_by = ?, used_at = ?, expires_at = ? WHERE id = ?",
+            (user_id, now, expires_at, tc_id),
+        )
+
+        # Upgrade user plan
+        await db.execute(
+            "UPDATE credits SET plan_name = ?, balance = ?, monthly_quota = ?, sub_status = 'trial', updated_at = ? WHERE user_id = ?",
+            (plan, credits, credits, now, user_id),
+        )
+
+        # Log transaction
+        await db.execute(
+            "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, ?, ?)",
+            (user_id, credits, "trial_activation", json.dumps({"code": code, "plan": plan, "days": duration_days})),
+        )
+
+        await db.commit()
+        return {"ok": True, "plan": plan, "credits": credits, "expires_at": expires_at, "days": duration_days}
     finally:
         await db.close()
 
