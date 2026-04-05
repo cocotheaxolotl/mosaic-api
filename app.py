@@ -2377,6 +2377,49 @@ class AffiliateApplyRequest(BaseModel):
     lang: str = "en"
 
 
+# ── AI Writing Tool Models ──────────────────────────────────────────────
+
+class TitleRequest(BaseModel):
+    genre: str
+    themes: str
+    audience: str
+    tone: str
+    language: str = "en"
+    count: int = 5
+
+class StoryStructureRequest(BaseModel):
+    genre: str
+    premise: str
+    protagonist: str
+    setting: str = ""
+    language: str = "en"
+
+class BlurbRequest(BaseModel):
+    title: str
+    genre: str
+    synopsis: str
+    protagonist: str
+    stakes: str = ""
+    tone: str = "dramatic"
+    language: str = "en"
+    count: int = 3
+
+# ── AI Writing Tool Rate Limiting ───────────────────────────────────────
+
+_title_rate: dict[str, list] = {}   # ip -> [timestamps]
+_story_rate: dict[str, list] = {}
+_blurb_rate: dict[str, list] = {}
+
+def _check_rate(store: dict, ip: str, max_per_hour: int):
+    now = time.time()
+    hits = store.get(ip, [])
+    hits = [t for t in hits if now - t < 3600]
+    if len(hits) >= max_per_hour:
+        raise HTTPException(429, f"Rate limit: {max_per_hour} requests per hour")
+    hits.append(now)
+    store[ip] = hits
+
+
 def _mask_email(email: str) -> str:
     """Mask email: j****n@g***l.com"""
     if not email or "@" not in email:
@@ -2720,6 +2763,189 @@ async def api_translate_book(
         media_type="application/octet-stream",
         headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
     )
+
+
+# ── AI Writing Tool Endpoints ───────────────────────────────────────────
+
+@app.post("/api/title-generator")
+async def api_title_generator(req: TitleRequest, request: Request):
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, "AI service not configured")
+
+    ip = request.client.host
+    _check_rate(_title_rate, ip, 10)
+
+    lang_instruction = "Respond entirely in French." if req.language == "fr" else "Respond entirely in English."
+
+    prompt = f"""Generate {req.count} book title suggestions.
+Genre: {req.genre}
+Key themes: {req.themes}
+Target audience: {req.audience}
+Tone: {req.tone}
+{lang_instruction}
+
+Return a JSON object with a "titles" key containing an array of objects with "title", "subtitle", and "reasoning" fields.
+Each title should be:
+- Memorable and marketable
+- Optimized for Amazon KDP search
+- Appropriate for the genre and audience
+- The subtitle should clarify the book's value proposition"""
+
+    oai_req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are a professional book title consultant specializing in Amazon KDP bestsellers. Generate compelling, marketable book titles with subtitles. Each title should be optimized for Amazon search discoverability while being memorable and genre-appropriate. Always respond with valid JSON only, no markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.9,
+            "max_tokens": 1500,
+            "response_format": {"type": "json_object"}
+        }).encode(),
+    )
+
+    loop = asyncio.get_event_loop()
+    try:
+        resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(oai_req, timeout=30))
+        body = json.loads(resp.read())
+    except Exception as e:
+        raise HTTPException(502, f"AI service error: {str(e)[:200]}")
+
+    content = body["choices"][0]["message"]["content"]
+    data = json.loads(content)
+    tokens = body.get("usage", {}).get("total_tokens", 0)
+
+    return {"titles": data.get("titles", data.get("suggestions", [])), "tokens_used": tokens}
+
+
+@app.post("/api/story-structure")
+async def api_story_structure(req: StoryStructureRequest, request: Request):
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, "AI service not configured")
+
+    ip = request.client.host
+    _check_rate(_story_rate, ip, 5)
+
+    lang_instruction = "Respond entirely in French." if req.language == "fr" else "Respond entirely in English."
+    setting_line = f"Setting: {req.setting}" if req.setting else ""
+
+    prompt = f"""Create a detailed Save the Cat beat sheet for the following novel concept.
+
+Genre: {req.genre}
+Premise: {req.premise}
+Protagonist: {req.protagonist}
+{setting_line}
+{lang_instruction}
+
+Return a JSON object with:
+- "logline": a compelling one-sentence logline
+- "beats": an array of 15 beat objects, each with:
+  - "beat_name": the Save the Cat beat name
+  - "description": brief description of what happens at this beat
+  - "page_range": approximate page range (for a 300-page novel)
+  - "details": 2-3 sentences of specific story detail for this beat
+
+The 15 beats in order: Opening Image, Theme Stated, Setup, Catalyst, Debate, Break into Two, B Story, Fun and Games, Midpoint, Bad Guys Close In, All Is Lost, Dark Night of the Soul, Break into Three, Finale, Final Image."""
+
+    oai_req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are an expert story structure consultant specializing in the Save the Cat beat sheet method by Blake Snyder. You help authors plan compelling novels with strong narrative structure. Always respond with valid JSON only, no markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.8,
+            "max_tokens": 3000,
+            "response_format": {"type": "json_object"}
+        }).encode(),
+    )
+
+    loop = asyncio.get_event_loop()
+    try:
+        resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(oai_req, timeout=45))
+        body = json.loads(resp.read())
+    except Exception as e:
+        raise HTTPException(502, f"AI service error: {str(e)[:200]}")
+
+    content = body["choices"][0]["message"]["content"]
+    data = json.loads(content)
+    tokens = body.get("usage", {}).get("total_tokens", 0)
+
+    return {"beats": data.get("beats", []), "logline": data.get("logline", ""), "tokens_used": tokens}
+
+
+@app.post("/api/blurb-generator")
+async def api_blurb_generator(req: BlurbRequest, request: Request):
+    if not OPENAI_API_KEY:
+        raise HTTPException(503, "AI service not configured")
+
+    ip = request.client.host
+    _check_rate(_blurb_rate, ip, 10)
+
+    lang_instruction = "Respond entirely in French." if req.language == "fr" else "Respond entirely in English."
+    stakes_line = f"Stakes: {req.stakes}" if req.stakes else ""
+
+    prompt = f"""Generate {req.count} compelling back cover blurbs for the following fiction book.
+
+Title: {req.title}
+Genre: {req.genre}
+Synopsis: {req.synopsis}
+Protagonist: {req.protagonist}
+{stakes_line}
+Tone: {req.tone}
+{lang_instruction}
+
+Return a JSON object with a "blurbs" key containing an array of objects with:
+- "text": the full blurb text (100-180 words each)
+- "hook_type": the type of hook used (e.g. "question", "action", "mystery", "emotional", "provocative")
+
+Each blurb should:
+- Open with an irresistible hook
+- Build intrigue and emotional tension
+- End with a cliffhanger or compelling question that makes readers want to buy
+- Be 100-180 words
+- Use varied hook types across the different blurbs"""
+
+    oai_req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        data=json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": "You are an expert copywriter specializing in fiction back cover blurbs and book marketing copy. You craft irresistible blurbs that hook readers instantly and drive purchases. Always respond with valid JSON only, no markdown."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.9,
+            "max_tokens": 2000,
+            "response_format": {"type": "json_object"}
+        }).encode(),
+    )
+
+    loop = asyncio.get_event_loop()
+    try:
+        resp = await loop.run_in_executor(None, lambda: urllib.request.urlopen(oai_req, timeout=30))
+        body = json.loads(resp.read())
+    except Exception as e:
+        raise HTTPException(502, f"AI service error: {str(e)[:200]}")
+
+    content = body["choices"][0]["message"]["content"]
+    data = json.loads(content)
+    tokens = body.get("usage", {}).get("total_tokens", 0)
+
+    return {"blurbs": data.get("blurbs", []), "tokens_used": tokens}
 
 
 @app.get("/api/health")
