@@ -2731,9 +2731,10 @@ async def api_translate_book(
     # Validate file type
     ext = Path(file.filename).suffix.lower() if file.filename else ""
     type_map = {".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-                ".pdf": "application/pdf", ".epub": "application/epub+zip"}
+                ".pdf": "application/pdf", ".epub": "application/epub+zip",
+                ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
     if ext not in type_map:
-        raise HTTPException(400, f"Unsupported file type: {ext}. Use .pptx, .pdf, or .epub")
+        raise HTTPException(400, f"Unsupported file type: {ext}. Use .pptx, .pdf, .epub, or .docx")
 
     content_type = type_map[ext]
 
