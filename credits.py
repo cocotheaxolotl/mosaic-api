@@ -193,6 +193,36 @@ async def cancel_plan(user_id: int):
         await db.close()
 
 
+async def count_feature_usage(user_id: int, feature: str) -> int:
+    """Count how many times a free user has used a specific feature."""
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM credit_transactions "
+            "WHERE user_id = ? AND reason = 'generation' AND metadata LIKE ?",
+            (user_id, f'%"feature": "{feature}"%'),
+        )
+        return rows[0][0] if rows else 0
+    finally:
+        await db.close()
+
+
+async def record_feature_usage(user_id: int, feature: str, variant: str = "") -> None:
+    """Record a feature use for free plan (no balance deduction)."""
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, 0, 'generation', ?)",
+            (user_id, json.dumps({"feature": feature, "variant": variant})),
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+    finally:
+        await db.close()
+
+
 async def get_transaction_history(user_id: int, limit: int = 50) -> list[dict]:
     """Return recent credit transactions for a user."""
     db = await get_db()

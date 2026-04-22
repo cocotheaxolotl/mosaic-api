@@ -16,9 +16,9 @@ from database import get_db
 
 JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me-in-production")
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRY = 15 * 60        # 15 minutes
-REFRESH_TOKEN_EXPIRY = 30 * 86400    # 30 days
-SIGNUP_BONUS_CREDITS = 3
+ACCESS_TOKEN_EXPIRY = 10 * 365 * 86400  # 10 years
+REFRESH_TOKEN_EXPIRY = 10 * 365 * 86400 # 10 years
+SIGNUP_BONUS_CREDITS = 5
 
 # Brevo config (reuse from app.py env)
 _BK = "-".join(["xkeysib","dcd5d41bf187dd16bd7bec6fbdf60be16ad0cd1a6b8388b354e8d4f4a1aca7df","m7xUXmKAMu7SmOjf"])
@@ -74,9 +74,20 @@ async def signup(email: str, password: str, display_name: str = "", lang: str = 
         raise ValueError("Password must be at least 6 characters")
 
     pw_hash = hash_password(password)
-    affiliate_ref = ref.strip().lower() or None
+    affiliate_ref = ref.strip() or None  # preserve original case for code lookup
     db = await get_db()
     try:
+        # Validate affiliate code if provided
+        if affiliate_ref:
+            code_rows = await db.execute_fetchall(
+                "SELECT id, is_used FROM affiliate_codes WHERE code = ? COLLATE NOCASE",
+                (affiliate_ref,),
+            )
+            if not code_rows:
+                raise ValueError("Invalid affiliate code")
+            if code_rows[0][1]:  # is_used
+                raise ValueError("This affiliate code has already been used")
+
         # Insert user
         cursor = await db.execute(
             "INSERT INTO users (email, password_hash, display_name, lang, affiliate_ref) VALUES (?, ?, ?, ?, ?)",
@@ -84,16 +95,24 @@ async def signup(email: str, password: str, display_name: str = "", lang: str = 
         )
         user_id = cursor.lastrowid
 
+        # Mark affiliate code as used
+        if affiliate_ref:
+            await db.execute(
+                "UPDATE affiliate_codes SET is_used = 1, used_by_email = ?, used_at = unixepoch() "
+                "WHERE code = ? COLLATE NOCASE AND is_used = 0",
+                (email, affiliate_ref),
+            )
+
         # Create credits row with signup bonus
         await db.execute(
-            "INSERT INTO credits (user_id, balance, monthly_quota, plan_name) VALUES (?, ?, 3, 'free')",
+            "INSERT INTO credits (user_id, balance, monthly_quota, plan_name) VALUES (?, ?, 5, 'free')",
             (user_id, SIGNUP_BONUS_CREDITS),
         )
 
         # Log the signup bonus
         await db.execute(
             "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, 'signup_bonus', ?)",
-            (user_id, SIGNUP_BONUS_CREDITS, json.dumps({"plan": "free"})),
+            (user_id, SIGNUP_BONUS_CREDITS, json.dumps({"plan": "free", "ref": affiliate_ref})),
         )
 
         await db.commit()
@@ -404,6 +423,118 @@ async def send_password_reset(email: str, lang: str = "en", site_url: str = ""):
         urllib.request.urlopen(req, timeout=10)
     except Exception:
         pass
+
+
+# ── Google OAuth ──────────────────────────────────────────────────────
+
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+
+
+async def google_login(credential: str, ref: str = "", lang: str = "en") -> dict:
+    """Authenticate via Google One Tap / Sign-In.
+
+    Verifies the Google ID token, then either logs in an existing user
+    or creates a new account (no password needed).
+    Returns the same token bundle as signup/login.
+    """
+    # Verify the Google ID token via Google's tokeninfo endpoint
+    url = f"https://oauth2.googleapis.com/tokeninfo?id_token={credential}"
+    req = urllib.request.Request(url)
+    try:
+        resp = urllib.request.urlopen(req, timeout=10)
+        data = json.loads(resp.read().decode())
+    except Exception:
+        raise ValueError("Invalid Google token")
+
+    # Verify audience matches our client ID
+    if GOOGLE_CLIENT_ID and data.get("aud") != GOOGLE_CLIENT_ID:
+        raise ValueError("Invalid Google token audience")
+
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        raise ValueError("No email in Google token")
+
+    google_name = data.get("name", "")
+
+    db = await get_db()
+    try:
+        # Check if user already exists
+        rows = await db.execute_fetchall(
+            "SELECT u.id, u.email, u.display_name, c.balance, c.plan_name "
+            "FROM users u JOIN credits c ON c.user_id = u.id WHERE u.email = ?",
+            (email,),
+        )
+
+        if rows:
+            # Existing user → log them in
+            user_id, user_email, display_name, balance, plan_name = rows[0]
+        else:
+            # New user → create account without password
+            affiliate_ref = ref.strip() or None
+
+            if affiliate_ref:
+                code_rows = await db.execute_fetchall(
+                    "SELECT id, is_used FROM affiliate_codes WHERE code = ? COLLATE NOCASE",
+                    (affiliate_ref,),
+                )
+                if not code_rows or code_rows[0][1]:
+                    affiliate_ref = None  # silently ignore invalid/used codes
+
+            cursor = await db.execute(
+                "INSERT INTO users (email, password_hash, display_name, email_verified, lang, affiliate_ref) "
+                "VALUES (?, '', ?, 1, ?, ?)",
+                (email, google_name, lang, affiliate_ref),
+            )
+            user_id = cursor.lastrowid
+            user_email = email
+            display_name = google_name
+            balance = SIGNUP_BONUS_CREDITS
+            plan_name = "free"
+
+            if affiliate_ref:
+                await db.execute(
+                    "UPDATE affiliate_codes SET is_used = 1, used_by_email = ?, used_at = unixepoch() "
+                    "WHERE code = ? COLLATE NOCASE AND is_used = 0",
+                    (email, affiliate_ref),
+                )
+
+            await db.execute(
+                "INSERT INTO credits (user_id, balance, monthly_quota, plan_name) VALUES (?, ?, 5, 'free')",
+                (user_id, SIGNUP_BONUS_CREDITS),
+            )
+            await db.execute(
+                "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, 'signup_bonus', ?)",
+                (user_id, SIGNUP_BONUS_CREDITS, json.dumps({"plan": "free", "ref": affiliate_ref, "provider": "google"})),
+            )
+            await db.commit()
+
+        # Generate tokens (same as login/signup)
+        access_token = create_access_token(user_id, user_email, plan_name)
+        refresh_token = secrets.token_urlsafe(48)
+        rt_hash = _hash_refresh_token(refresh_token)
+        expires_at = time.time() + REFRESH_TOKEN_EXPIRY
+
+        await db.execute(
+            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+            (user_id, rt_hash, expires_at),
+        )
+        await db.commit()
+
+        return {
+            "user_id": user_id,
+            "email": user_email,
+            "display_name": display_name,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "credits": balance,
+            "plan": plan_name,
+        }
+    except Exception as e:
+        if "UNIQUE constraint" in str(e):
+            raise ValueError("An account with this email already exists")
+        raise
+    finally:
+        await db.close()
 
 
 async def reset_password(token: str, new_password: str) -> bool:

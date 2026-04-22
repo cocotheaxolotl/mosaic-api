@@ -2492,7 +2492,7 @@ def _stack(top: Image.Image, bottom: Image.Image, gap: int = 10) -> Image.Image:
 
 # ── ZIP helper (for bulk) ───────────────────────────────────────────────
 
-def images_to_zip(results: list, include_answer: bool = True,
+def images_to_zip(results: list, include_answer: bool = False,
                    plan: str = "pro") -> bytes:
     """Pack multiple results into a ZIP (in memory).
 

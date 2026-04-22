@@ -18,4 +18,4 @@ primary_region = 'cdg'
 [[vm]]
   cpu_kind = 'performance'
   cpus = 1
-  memory_mb = 2048
+  memory_mb = 4096
