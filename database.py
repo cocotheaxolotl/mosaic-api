@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS dynamic_qrcodes (
     target_url  TEXT NOT NULL,
     label       TEXT DEFAULT '',
     scan_count  INTEGER DEFAULT 0,
+    style_json  TEXT DEFAULT NULL,
     created_at  REAL NOT NULL DEFAULT (unixepoch()),
     updated_at  REAL NOT NULL DEFAULT (unixepoch())
 );
@@ -172,6 +173,11 @@ async def init_db():
         # Migration: add affiliate_ref column if missing (existing databases)
         try:
             await db.execute("ALTER TABLE users ADD COLUMN affiliate_ref TEXT DEFAULT NULL")
+        except Exception:
+            pass  # column already exists
+        # Migration: add style_json column to dynamic_qrcodes (saves QR styling so users can re-download styled image)
+        try:
+            await db.execute("ALTER TABLE dynamic_qrcodes ADD COLUMN style_json TEXT DEFAULT NULL")
         except Exception:
             pass  # column already exists
         # Migration: affiliate_commissions and affiliate_payouts may not exist on old DBs

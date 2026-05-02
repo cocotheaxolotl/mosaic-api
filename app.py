@@ -1588,8 +1588,14 @@ async def qr_create(request: Request, body: dict = Body(...)):
 
     target_url = (body.get("target_url") or "").strip()
     label = (body.get("label") or "").strip()[:100]
+    style = body.get("style")  # dict with fg/bg colors, dot_shape, eye_style, frame_text, logo_data_url, size, ec_level
     if not target_url or not target_url.startswith("http"):
         raise HTTPException(400, "A valid URL is required")
+
+    style_json = None
+    if isinstance(style, dict) and style:
+        import json as _json
+        style_json = _json.dumps(style)[:50000]  # cap to 50KB (logo data URLs can be large)
 
     # Consume 3 credits
     ok, _bal = await credits_module.consume_credits(user_id, 3, "dynamic_qr", {"label": label})
@@ -1602,15 +1608,15 @@ async def qr_create(request: Request, body: dict = Body(...)):
     db = await get_db()
     try:
         await db.execute(
-            "INSERT INTO dynamic_qrcodes (id, user_id, short_code, target_url, label) VALUES (?,?,?,?,?)",
-            (qr_id, user_id, short_code, target_url, label)
+            "INSERT INTO dynamic_qrcodes (id, user_id, short_code, target_url, label, style_json) VALUES (?,?,?,?,?,?)",
+            (qr_id, user_id, short_code, target_url, label, style_json)
         )
         await db.commit()
     finally:
         await db.close()
 
     redirect_url = f"{API_PUBLIC_URL}/go/{short_code}"
-    return {"id": qr_id, "short_code": short_code, "redirect_url": redirect_url, "target_url": target_url, "label": label, "scan_count": 0}
+    return {"id": qr_id, "short_code": short_code, "redirect_url": redirect_url, "target_url": target_url, "label": label, "scan_count": 0, "style": style if style_json else None}
 
 
 @app.get("/api/qr/list")
@@ -1623,20 +1629,28 @@ async def qr_list(request: Request):
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
-            "SELECT id, short_code, target_url, label, scan_count, created_at FROM dynamic_qrcodes WHERE user_id=? ORDER BY created_at DESC",
+            "SELECT id, short_code, target_url, label, scan_count, created_at, style_json FROM dynamic_qrcodes WHERE user_id=? ORDER BY created_at DESC",
             (user_id,)
         )
     finally:
         await db.close()
 
-    return [
-        {
+    import json as _json
+    out = []
+    for r in rows:
+        style = None
+        if r[6]:
+            try:
+                style = _json.loads(r[6])
+            except Exception:
+                style = None
+        out.append({
             "id": r[0], "short_code": r[1], "target_url": r[2],
             "label": r[3], "scan_count": r[4], "created_at": r[5],
-            "redirect_url": f"{API_PUBLIC_URL}/go/{r[1]}"
-        }
-        for r in rows
-    ]
+            "redirect_url": f"{API_PUBLIC_URL}/go/{r[1]}",
+            "style": style,
+        })
+    return out
 
 
 @app.put("/api/qr/{qr_id}")
@@ -1647,15 +1661,24 @@ async def qr_update(qr_id: str, request: Request, body: dict = Body(...)):
         raise HTTPException(401, "Login required")
 
     target_url = (body.get("target_url") or "").strip()
+    style = body.get("style")  # optional: replace styling
     if not target_url or not target_url.startswith("http"):
         raise HTTPException(400, "A valid URL is required")
 
     db = await get_db()
     try:
-        cur = await db.execute(
-            "UPDATE dynamic_qrcodes SET target_url=?, updated_at=unixepoch() WHERE id=? AND user_id=?",
-            (target_url, qr_id, user_id)
-        )
+        if isinstance(style, dict) and style:
+            import json as _json
+            style_json = _json.dumps(style)[:50000]
+            cur = await db.execute(
+                "UPDATE dynamic_qrcodes SET target_url=?, style_json=?, updated_at=unixepoch() WHERE id=? AND user_id=?",
+                (target_url, style_json, qr_id, user_id)
+            )
+        else:
+            cur = await db.execute(
+                "UPDATE dynamic_qrcodes SET target_url=?, updated_at=unixepoch() WHERE id=? AND user_id=?",
+                (target_url, qr_id, user_id)
+            )
         if cur.rowcount == 0:
             raise HTTPException(404, "QR code not found")
         await db.commit()
