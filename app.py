@@ -62,7 +62,7 @@ from mosaic_engine import (
 
 # ── Config ───────────────────────────────────────────────────────────────
 
-FREE_LIMIT = 3                # free generations per user
+FREE_LIMIT = 0                # IA réservée aux comptes payants : aucune génération gratuite (ni anonyme, ni compte gratuit)
 MAX_BULK = 50                 # max images in one bulk request
 MAX_IMAGE_SIZE = 10_000_000   # 10 MB per image
 
