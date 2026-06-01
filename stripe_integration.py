@@ -76,6 +76,18 @@ def _checkout_payment_methods(currency: str) -> list[str]:
     return ["card", "sepa_debit"] if currency == "eur" else ["card"]
 
 
+def _create_checkout_session_with_fallback(**kwargs):
+    """Create Checkout and fall back to card if Stripe has not activated SEPA yet."""
+    try:
+        return stripe.checkout.Session.create(**kwargs)
+    except stripe.error.InvalidRequestError as exc:
+        methods = kwargs.get("payment_method_types") or []
+        if "sepa_debit" not in methods or "payment method type provided: sepa_debit is invalid" not in str(exc).lower():
+            raise
+        kwargs = {**kwargs, "payment_method_types": ["card"]}
+        return stripe.checkout.Session.create(**kwargs)
+
+
 def get_plans_public():
     """Return plan info suitable for the pricing page (no secret IDs)."""
     return [
@@ -150,7 +162,7 @@ async def create_checkout_session(
         price_id = pack["price_id_eur"] if currency == "eur" and pack.get("price_id_eur") else pack["price_id"]
         if not price_id:
             raise ValueError(f"Stripe price not configured for pack: {plan_key}")
-        session = stripe.checkout.Session.create(
+        session = _create_checkout_session_with_fallback(
             customer=customer_id,
             line_items=[{"price": price_id, "quantity": 1}],
             mode="payment",
@@ -179,7 +191,7 @@ async def create_checkout_session(
     if not price_id:
         raise ValueError(f"Stripe price not configured for {plan_key}/{billing}")
 
-    session = stripe.checkout.Session.create(
+    session = _create_checkout_session_with_fallback(
         customer=customer_id,
         line_items=[{"price": price_id, "quantity": 1}],
         mode="subscription",
