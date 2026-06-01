@@ -71,6 +71,11 @@ CREDIT_PACKS = {
 }
 
 
+def _checkout_payment_methods(currency: str) -> list[str]:
+    """Allow RIB/SEPA for all EUR Checkout sessions."""
+    return ["card", "sepa_debit"] if currency == "eur" else ["card"]
+
+
 def get_plans_public():
     """Return plan info suitable for the pricing page (no secret IDs)."""
     return [
@@ -126,6 +131,7 @@ async def create_checkout_session(
     billing: 'monthly' | 'annual' (ignored for credit packs)
     currency: 'usd' | 'eur'
     """
+    currency = (currency or "usd").lower()
     customer_id = await _get_or_create_customer(user_id, email)
     affiliate_ref = ref.strip().lower() if ref else ""
 
@@ -148,6 +154,7 @@ async def create_checkout_session(
             customer=customer_id,
             line_items=[{"price": price_id, "quantity": 1}],
             mode="payment",
+            payment_method_types=_checkout_payment_methods(currency),
             allow_promotion_codes=True,
             success_url=f"{SITE_URL}/pricing/?success=true&session_id={{CHECKOUT_SESSION_ID}}",
             cancel_url=f"{SITE_URL}/pricing/?canceled=true",
@@ -176,6 +183,7 @@ async def create_checkout_session(
         customer=customer_id,
         line_items=[{"price": price_id, "quantity": 1}],
         mode="subscription",
+        payment_method_types=_checkout_payment_methods(currency),
         allow_promotion_codes=True,
         success_url=f"{SITE_URL}/pricing/?success=true&session_id={{CHECKOUT_SESSION_ID}}",
         cancel_url=f"{SITE_URL}/pricing/?canceled=true",
@@ -302,6 +310,66 @@ async def _record_affiliate_payout(customer_id: str, amount_cents: int, invoice_
         await db.close()
 
 
+async def _fulfill_checkout_session(data: dict) -> dict:
+    """Fulfill a paid Checkout Session after instant or async payment success."""
+    user_id_str = data.get("metadata", {}).get("coco_user_id")
+    customer_id = data.get("customer")
+
+    # Credit pack purchase (one-time payment)
+    pack_key = data.get("metadata", {}).get("pack")
+    if user_id_str and pack_key and pack_key in CREDIT_PACKS:
+        user_id = int(user_id_str)
+        pack = CREDIT_PACKS[pack_key]
+        await credits_module.add_credits(
+            user_id,
+            amount=pack["credits"],
+            reason="credit_pack_purchase",
+            metadata=json.dumps({"pack": pack_key}),
+        )
+        return {"handled": True, "action": "credit_pack_purchased", "pack": pack_key, "credits": pack["credits"]}
+
+    # New subscription activated
+    plan_key = data.get("metadata", {}).get("plan")
+    if user_id_str and plan_key and plan_key in PLANS:
+        user_id = int(user_id_str)
+        plan = PLANS[plan_key]
+        sub_id = data.get("subscription")
+        affiliate_ref = (data.get("metadata", {}).get("affiliate_ref") or "").strip().lower()
+
+        # Update user's Stripe customer ID if needed
+        db = await get_db()
+        try:
+            await db.execute(
+                "UPDATE users SET stripe_customer_id = ? WHERE id = ?",
+                (customer_id, user_id),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        # Set plan and credit the account
+        await credits_module.set_plan(
+            user_id,
+            plan_name=plan_key,
+            monthly_quota=plan["credits"],
+            stripe_sub_id=sub_id,
+            sub_status="active",
+        )
+
+        # Record affiliate commission if a valid code was used
+        if affiliate_ref:
+            await _record_affiliate_commission(
+                affiliate_code=affiliate_ref,
+                customer_id=customer_id,
+                subscription_id=sub_id,
+                plan=plan_key,
+            )
+
+        return {"handled": True, "action": "subscription_started", "plan": plan_key}
+
+    return {"handled": False, "event_type": "checkout.session"}
+
+
 async def handle_webhook(payload: bytes, sig_header: str) -> dict:
     """Process a Stripe webhook event. Returns a status dict."""
     try:
@@ -313,60 +381,15 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
     data = event["data"]["object"]
 
     if event_type == "checkout.session.completed":
-        user_id_str = data.get("metadata", {}).get("coco_user_id")
-        customer_id = data.get("customer")
+        if data.get("payment_status") == "paid":
+            return await _fulfill_checkout_session(data)
+        return {"handled": True, "action": "awaiting_async_payment"}
 
-        # Credit pack purchase (one-time payment)
-        pack_key = data.get("metadata", {}).get("pack")
-        if user_id_str and pack_key and pack_key in CREDIT_PACKS:
-            user_id = int(user_id_str)
-            pack = CREDIT_PACKS[pack_key]
-            await credits_module.add_credits(
-                user_id,
-                amount=pack["credits"],
-                reason="credit_pack_purchase",
-                metadata=json.dumps({"pack": pack_key}),
-            )
-            return {"handled": True, "action": "credit_pack_purchased", "pack": pack_key, "credits": pack["credits"]}
+    elif event_type == "checkout.session.async_payment_succeeded":
+        return await _fulfill_checkout_session(data)
 
-        # New subscription activated
-        plan_key = data.get("metadata", {}).get("plan")
-        if user_id_str and plan_key and plan_key in PLANS:
-            user_id = int(user_id_str)
-            plan = PLANS[plan_key]
-            sub_id = data.get("subscription")
-            affiliate_ref = (data.get("metadata", {}).get("affiliate_ref") or "").strip().lower()
-
-            # Update user's Stripe customer ID if needed
-            db = await get_db()
-            try:
-                await db.execute(
-                    "UPDATE users SET stripe_customer_id = ? WHERE id = ?",
-                    (customer_id, user_id),
-                )
-                await db.commit()
-            finally:
-                await db.close()
-
-            # Set plan and credit the account
-            await credits_module.set_plan(
-                user_id,
-                plan_name=plan_key,
-                monthly_quota=plan["credits"],
-                stripe_sub_id=sub_id,
-                sub_status="active",
-            )
-
-            # Record affiliate commission if a valid code was used
-            if affiliate_ref:
-                await _record_affiliate_commission(
-                    affiliate_code=affiliate_ref,
-                    customer_id=customer_id,
-                    subscription_id=sub_id,
-                    plan=plan_key,
-                )
-
-            return {"handled": True, "action": "subscription_started", "plan": plan_key}
+    elif event_type == "checkout.session.async_payment_failed":
+        return {"handled": True, "action": "async_payment_failed"}
 
     elif event_type == "invoice.paid":
         # Monthly renewal — reset credits
