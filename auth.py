@@ -18,7 +18,7 @@ JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-me-in-production")
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRY = 10 * 365 * 86400  # 10 years
 REFRESH_TOKEN_EXPIRY = 10 * 365 * 86400 # 10 years
-SIGNUP_BONUS_CREDITS = 0  # IA réservée aux comptes payants : aucun crédit gratuit à l'inscription
+SIGNUP_BONUS_CREDITS = 3  # Free plan: 3 non-AI tool uses per day.
 
 # Brevo config (reuse from app.py env)
 _BK = "-".join(["xkeysib","dcd5d41bf187dd16bd7bec6fbdf60be16ad0cd1a6b8388b354e8d4f4a1aca7df","m7xUXmKAMu7SmOjf"])
@@ -105,8 +105,8 @@ async def signup(email: str, password: str, display_name: str = "", lang: str = 
 
         # Create credits row with signup bonus
         await db.execute(
-            "INSERT INTO credits (user_id, balance, monthly_quota, plan_name) VALUES (?, ?, 0, 'free')",
-            (user_id, SIGNUP_BONUS_CREDITS),
+            "INSERT INTO credits (user_id, balance, monthly_quota, plan_name) VALUES (?, ?, ?, 'free')",
+            (user_id, SIGNUP_BONUS_CREDITS, SIGNUP_BONUS_CREDITS),
         )
 
         # Log the signup bonus
@@ -499,8 +499,8 @@ async def google_login(credential: str, ref: str = "", lang: str = "en") -> dict
                 )
 
             await db.execute(
-                "INSERT INTO credits (user_id, balance, monthly_quota, plan_name) VALUES (?, ?, 0, 'free')",
-                (user_id, SIGNUP_BONUS_CREDITS),
+                "INSERT INTO credits (user_id, balance, monthly_quota, plan_name) VALUES (?, ?, ?, 'free')",
+                (user_id, SIGNUP_BONUS_CREDITS, SIGNUP_BONUS_CREDITS),
             )
             await db.execute(
                 "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, 'signup_bonus', ?)",

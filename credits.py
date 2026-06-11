@@ -4,8 +4,19 @@ Credits module — balance management, consumption, and transaction logging.
 
 import json
 import time
+from datetime import datetime, timezone
 
 from database import get_db
+
+FREE_DAILY_QUOTA = 3
+
+
+def _is_current_day(timestamp: float | None) -> bool:
+    if not timestamp:
+        return False
+    current = datetime.now(timezone.utc)
+    updated = datetime.fromtimestamp(timestamp, timezone.utc)
+    return updated.date() == current.date()
 
 
 async def get_balance(user_id: int) -> int:
@@ -22,6 +33,7 @@ async def get_balance(user_id: int) -> int:
 
 async def get_plan_info(user_id: int) -> dict | None:
     """Return full plan info for a user."""
+    await reset_free_daily_quota_if_needed(user_id)
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
@@ -39,6 +51,47 @@ async def get_plan_info(user_id: int) -> dict | None:
             "sub_status": r[3],
             "stripe_sub_id": r[4],
         }
+    finally:
+        await db.close()
+
+
+async def reset_free_daily_quota_if_needed(user_id: int) -> int | None:
+    """Reset/repair Free daily credits at the first use of a new UTC day."""
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            "SELECT balance, monthly_quota, plan_name, updated_at FROM credits WHERE user_id = ?",
+            (user_id,),
+        )
+        if not rows:
+            return None
+
+        balance, monthly_quota, plan_name, updated_at = rows[0]
+        if plan_name != "free":
+            return balance
+
+        quota = monthly_quota if monthly_quota and monthly_quota > 0 else FREE_DAILY_QUOTA
+        should_repair_quota = quota != monthly_quota
+        should_reset_balance = not _is_current_day(updated_at)
+
+        if not should_repair_quota and not should_reset_balance:
+            return balance
+
+        new_balance = quota if should_reset_balance else balance
+        await db.execute(
+            "UPDATE credits SET balance = ?, monthly_quota = ?, updated_at = ? WHERE user_id = ?",
+            (new_balance, quota, time.time(), user_id),
+        )
+        if should_reset_balance:
+            await db.execute(
+                "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, ?, ?)",
+                (user_id, quota, "free_daily_reset", json.dumps({"plan": "free", "quota": quota})),
+            )
+        await db.commit()
+        return new_balance
+    except Exception:
+        await db.rollback()
+        raise
     finally:
         await db.close()
 

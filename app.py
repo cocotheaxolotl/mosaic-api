@@ -1364,11 +1364,9 @@ async def api_credits_history(request: Request):
     return {"transactions": history}
 
 
-FREE_FEATURE_LIMIT = 3  # uses per tool for free plan
-
 @app.post("/api/credits/consume")
 async def api_credits_consume(request: Request, req: ConsumeRequest):
-    """Consume 1 credit for a feature. Free plan: 3 uses per tool. Paid: deduct from balance."""
+    """Consume 1 credit for a feature. Free plan: 3 non-AI tool uses per day."""
     user_id, _ = await get_user_or_ip(request)
     if not user_id:
         raise HTTPException(401, "Not authenticated")
@@ -1376,25 +1374,14 @@ async def api_credits_consume(request: Request, req: ConsumeRequest):
     plan_info = await credits_module.get_plan_info(user_id)
     plan_name = (plan_info or {}).get("plan_name", "free")
 
-    if plan_name == "free":
-        feature = req.feature or "tool-download"
-        used = await credits_module.count_feature_usage(user_id, feature)
-        if used >= FREE_FEATURE_LIMIT:
-            raise HTTPException(402, {
-                "error": "Free limit reached",
-                "remaining": 0,
-                "upgrade_url": "https://univers.studio/pricing/",
-            })
-        await credits_module.record_feature_usage(user_id, feature, req.variant or "")
-        return {"ok": True, "remaining": FREE_FEATURE_LIMIT - used - 1}
-
     success, remaining = await credits_module.consume_credits(
         user_id, 1, "generation",
         metadata={"feature": req.feature, "variant": req.variant},
     )
     if not success:
+        error = "Free daily limit reached" if plan_name == "free" else "Insufficient credits"
         raise HTTPException(402, {
-            "error": "Insufficient credits",
+            "error": error,
             "remaining": remaining,
             "upgrade_url": "https://univers.studio/pricing/",
         })
