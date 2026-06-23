@@ -5,6 +5,7 @@ Uses OpenAI GPT-4o-mini for translation with vision-based context detection.
 
 import base64, io, os, re, shutil, tempfile, zipfile
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from openai import OpenAI
 
 OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -99,25 +100,45 @@ def _translate_single(client, text, lang_name, book_context=""):
     return r.choices[0].message.content.strip()
 
 
-def _batch_translate(client, all_texts, lang_name, batch_size=20, book_context=""):
-    """Translate all texts in batches."""
-    translated = []
-    for i in range(0, len(all_texts), batch_size):
-        batch = all_texts[i:i + batch_size]
+def _batch_translate(client, all_texts, lang_name, batch_size=40, book_context="", max_workers=12):
+    """Translate all texts, running batches concurrently to cut wall-clock time."""
+    if not all_texts:
+        return []
+
+    chunks = [all_texts[i:i + batch_size] for i in range(0, len(all_texts), batch_size)]
+
+    def _do(batch):
         try:
-            translated.extend(_translate_batch(client, batch, lang_name, book_context))
+            return _translate_batch(client, batch, lang_name, book_context)
         except Exception:
+            out = []
             for t in batch:
                 try:
-                    translated.append(_translate_single(client, t, lang_name, book_context))
+                    out.append(_translate_single(client, t, lang_name, book_context))
                 except Exception:
-                    translated.append(t)
+                    out.append(t)
+            return out
+
+    # Single chunk: no thread overhead.
+    if len(chunks) == 1:
+        return _do(chunks[0])
+
+    results = [None] * len(chunks)
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(chunks))) as ex:
+        future_to_idx = {ex.submit(_do, c): i for i, c in enumerate(chunks)}
+        for fut in future_to_idx:
+            idx = future_to_idx[fut]
+            results[idx] = fut.result()
+
+    translated = []
+    for r in results:
+        translated.extend(r)
     return translated
 
 
 # ── PPTX ─────────────────────────────────────────────────────────────
 
-def translate_pptx(data: bytes, lang_code: str) -> bytes:
+def translate_pptx(data: bytes, lang_code: str, progress_cb=None) -> bytes:
     """Translate PPTX preserving all formatting (fonts, colors, sizes, images)."""
     from pptx import Presentation
 
@@ -125,6 +146,13 @@ def translate_pptx(data: bytes, lang_code: str) -> bytes:
     client = _get_client()
 
     prs = Presentation(io.BytesIO(data))
+    _total_slides = len(prs.slides._sldIdLst) if hasattr(prs.slides, '_sldIdLst') else len(list(prs.slides))
+    _done_slides = 0
+    if progress_cb:
+        try:
+            progress_cb(0, _total_slides)
+        except Exception:
+            pass
 
     # Analyze up to 3 slide images for context
     book_context = ""
@@ -159,6 +187,12 @@ def translate_pptx(data: bytes, lang_code: str) -> bytes:
                     paragraphs.append((shape, pi, full))
 
         if not paragraphs:
+            _done_slides += 1
+            if progress_cb:
+                try:
+                    progress_cb(_done_slides, _total_slides)
+                except Exception:
+                    pass
             continue
 
         all_texts = [p[2] for p in paragraphs]
@@ -172,6 +206,13 @@ def translate_pptx(data: bytes, lang_code: str) -> bytes:
             para.runs[0].text = new_text
             for run in para.runs[1:]:
                 run.text = ""
+
+        _done_slides += 1
+        if progress_cb:
+            try:
+                progress_cb(_done_slides, _total_slides)
+            except Exception:
+                pass
 
     buf = io.BytesIO()
     prs.save(buf)
@@ -223,7 +264,7 @@ def _extract_page_fonts(doc, page):
     return font_buffers
 
 
-def translate_pdf(data: bytes, lang_code: str) -> bytes:
+def translate_pdf(data: bytes, lang_code: str, progress_cb=None) -> bytes:
     """Translate PDF using redact & rewrite, preserving fonts and background colors."""
     import fitz
 
@@ -231,6 +272,11 @@ def translate_pdf(data: bytes, lang_code: str) -> bytes:
     client = _get_client()
 
     doc = fitz.open(stream=data, filetype="pdf")
+    if progress_cb:
+        try:
+            progress_cb(0, len(doc))
+        except Exception:
+            pass
 
     # Analyze up to 3 pages visually to understand book context
     book_context = ""
@@ -249,11 +295,13 @@ def translate_pdf(data: bytes, lang_code: str) -> bytes:
     if descriptions:
         book_context = " | ".join(d for d in descriptions if d)
 
+    # Pass 1: collect every span's text across the whole document (cheap, no rendering)
+    pages_info = []  # list of (page, text_items)
+    all_texts = []
     for pi in range(len(doc)):
         page = doc[pi]
         blocks = page.get_text("dict")["blocks"]
         text_items = []
-
         for block in blocks:
             if block["type"] != 0:
                 continue
@@ -262,8 +310,25 @@ def translate_pdf(data: bytes, lang_code: str) -> bytes:
                     txt = span["text"].strip()
                     if txt:
                         text_items.append((span, txt))
+        pages_info.append((page, text_items))
+        all_texts.extend(t[1] for t in text_items)
+
+    # Translate the WHOLE document in one parallel pass (all pages' batches run concurrently)
+    translated_all = _batch_translate(client, all_texts, lang_name, book_context=book_context)
+
+    # Pass 2: redact & rewrite each page with its slice of the translations
+    cursor = 0
+    for pi, (page, text_items) in enumerate(pages_info):
+        n = len(text_items)
+        translated = translated_all[cursor:cursor + n]
+        cursor += n
 
         if not text_items:
+            if progress_cb:
+                try:
+                    progress_cb(pi + 1, len(doc))
+                except Exception:
+                    pass
             continue
 
         # Extract embedded fonts before redacting (redaction may remove them)
@@ -271,9 +336,6 @@ def translate_pdf(data: bytes, lang_code: str) -> bytes:
 
         # Render page to sample background colors before redacting
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-
-        all_texts = [t[1] for t in text_items]
-        translated = _batch_translate(client, all_texts, lang_name, book_context=book_context)
 
         # Detect background color for each span, then redact
         for span, _ in text_items:
@@ -328,6 +390,12 @@ def translate_pdf(data: bytes, lang_code: str) -> bytes:
                 fontsize=max(font_size, 5),
                 color=(r_c, g_c, b_c),
             )
+
+        if progress_cb:
+            try:
+                progress_cb(pi + 1, len(doc))
+            except Exception:
+                pass
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -515,15 +583,15 @@ def translate_docx(data: bytes, lang_code: str) -> bytes:
 
 # ── Dispatcher ───────────────────────────────────────────────────────
 
-def translate_book(data: bytes, lang_code: str, content_type: str) -> bytes:
+def translate_book(data: bytes, lang_code: str, content_type: str, progress_cb=None) -> bytes:
     """Route to the correct translator based on content type."""
     if 'presentation' in content_type or content_type.endswith('.pptx'):
-        return translate_pptx(data, lang_code)
+        return translate_pptx(data, lang_code, progress_cb)
     elif 'pdf' in content_type:
-        return translate_pdf(data, lang_code)
+        return translate_pdf(data, lang_code, progress_cb)
     elif 'epub' in content_type:
-        return translate_epub(data, lang_code)
+        return translate_epub(data, lang_code, progress_cb)
     elif 'wordprocessingml' in content_type or content_type.endswith('.docx'):
-        return translate_docx(data, lang_code)
+        return translate_docx(data, lang_code, progress_cb)
     else:
         raise ValueError(f"Unsupported content type: {content_type}")
