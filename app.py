@@ -109,6 +109,19 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup():
     await init_db()
+    import annual_credits
+    app.state.annual_credit_worker = asyncio.create_task(annual_credits.run_forever())
+
+
+@app.on_event("shutdown")
+async def stop_annual_credit_worker():
+    task = getattr(app.state, "annual_credit_worker", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 # ── Auth helper ──────────────────────────────────────────────────────────

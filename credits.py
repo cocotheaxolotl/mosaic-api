@@ -59,6 +59,7 @@ async def reset_free_daily_quota_if_needed(user_id: int) -> int | None:
     """Reset/repair Free daily credits at the first use of a new UTC day."""
     db = await get_db()
     try:
+        await db.execute("BEGIN IMMEDIATE")
         rows = await db.execute_fetchall(
             "SELECT balance, monthly_quota, plan_name, updated_at FROM credits WHERE user_id = ?",
             (user_id,),
@@ -106,6 +107,7 @@ async def consume_credits(
     """
     db = await get_db()
     try:
+        await db.execute("BEGIN IMMEDIATE")
         # Check balance
         rows = await db.execute_fetchall(
             "SELECT balance FROM credits WHERE user_id = ?", (user_id,)
@@ -145,6 +147,7 @@ async def add_credits(
     """Add credits to a user's balance. Returns new balance."""
     db = await get_db()
     try:
+        await db.execute("BEGIN IMMEDIATE")
         rows = await db.execute_fetchall(
             "SELECT balance FROM credits WHERE user_id = ?", (user_id,)
         )
@@ -182,6 +185,7 @@ async def set_plan(
     """
     db = await get_db()
     try:
+        await db.execute("BEGIN IMMEDIATE")
         await db.execute(
             "UPDATE credits SET plan_name = ?, monthly_quota = ?, balance = ?, "
             "stripe_sub_id = ?, sub_status = ?, current_period_end = ?, updated_at = ? "
@@ -207,6 +211,7 @@ async def renew_credits(user_id: int) -> int:
     """Reset credits to monthly quota on subscription renewal. Returns new balance."""
     db = await get_db()
     try:
+        await db.execute("BEGIN IMMEDIATE")
         rows = await db.execute_fetchall(
             "SELECT monthly_quota, plan_name FROM credits WHERE user_id = ?",
             (user_id,),

@@ -44,6 +44,25 @@ CREATE TABLE IF NOT EXISTS credit_transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_txn_user ON credit_transactions(user_id, created_at);
 
+CREATE TABLE IF NOT EXISTS annual_credit_policy (
+    id INTEGER PRIMARY KEY CHECK (id=1),
+    live_from REAL NOT NULL
+);
+INSERT OR IGNORE INTO annual_credit_policy(id,live_from) VALUES(1,unixepoch());
+
+CREATE TABLE IF NOT EXISTS annual_credit_periods (
+    stripe_sub_id TEXT NOT NULL,
+    period_start INTEGER NOT NULL,
+    period_end INTEGER NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    quota INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('already_granted','pending_review','expired','granted')),
+    balance_before INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(stripe_sub_id,period_start)
+);
+
 CREATE TABLE IF NOT EXISTS refresh_tokens (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id    INTEGER NOT NULL REFERENCES users(id),

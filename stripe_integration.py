@@ -2,6 +2,7 @@
 Stripe integration — Checkout, Customer Portal, and Webhook handling.
 """
 
+import asyncio
 import os
 import json
 
@@ -414,9 +415,35 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
                 amount_paid = data.get("amount_paid", 0)
                 invoice_id = data.get("id")
                 if billing_reason == "subscription_cycle":
-                    await credits_module.renew_credits(user_id)
+                    subscription_id = data.get("subscription") or (
+                        ((data.get("parent") or {}).get("subscription_details") or {}).get("subscription"))
+                    subscription = None
+                    if subscription_id:
+                        subscription = await asyncio.to_thread(
+                            stripe.Subscription.retrieve, subscription_id, expand=["latest_invoice"])
+                    items = ((subscription or {}).get("items") or {}).get("data") or []
+                    recurring = (items[0].get("price") or {}).get("recurring") or {} if items else {}
+                    if recurring.get("interval") == "year":
+                        # The annual worker owns the monthly ledger, including the
+                        # first month of a new paid year. Retries cannot refill twice.
+                        import annual_credits
+                        await annual_credits.process_subscription(user_id, subscription)
+                        action = "annual_credit_period_checked"
+                    else:
+                        # Do not let an old overlapping subscription reset the
+                        # balance of a newer plan for the same Stripe customer.
+                        db = await get_db()
+                        try:
+                            current = await db.execute_fetchall(
+                                "SELECT stripe_sub_id FROM credits WHERE user_id=?", (user_id,))
+                        finally:
+                            await db.close()
+                        action = "stale_subscription_ignored"
+                        if current and (not subscription_id or current[0][0] == subscription_id):
+                            await credits_module.renew_credits(user_id)
+                            action = "credits_renewed"
                     await _record_affiliate_payout(customer_id, amount_paid, invoice_id)
-                    return {"handled": True, "action": "credits_renewed"}
+                    return {"handled": True, "action": action}
                 elif billing_reason == "subscription_create":
                     # First invoice — record month 1 commission payout
                     await _record_affiliate_payout(customer_id, amount_paid, invoice_id)
