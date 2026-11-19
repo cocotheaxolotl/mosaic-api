@@ -44,7 +44,9 @@ async def get_plan_info(user_id: int) -> dict | None:
         if not rows:
             return None
         r = rows[0]
+        import tool_credits
         return {
+            "tool_credits": await tool_credits.get_balance(user_id),
             "balance": r[0],
             "monthly_quota": r[1],
             "plan_name": r[2],
@@ -163,7 +165,7 @@ async def protected_extra_credits(db, user_id: int, balance: int) -> int:
     )
     subscription, packs = 0, 0
     for delta, reason, metadata in rows:
-        if reason in ("credit_pack_purchase", "customer_service_gift", "promotional_gift"):
+        if reason in ("credit_pack_purchase", "customer_service_gift"):
             packs += max(delta, 0)
         elif reason in ("subscription_start", "subscription_renewal", "free_daily_reset", "trial_activation", "signup_bonus", "trial_expired"):
             try:

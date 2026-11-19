@@ -270,7 +270,9 @@ async def get_me(user_id: int) -> dict | None:
         if not rows:
             return None
         r = rows[0]
+        import tool_credits
         return {
+            "tool_credits": await tool_credits.get_balance(user_id),
             "user_id": r[0],
             "email": r[1],
             "display_name": r[2],

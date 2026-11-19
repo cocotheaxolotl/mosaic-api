@@ -3,6 +3,7 @@ import json
 from time import time as _now
 from database import get_db
 import credits
+import tool_credits
 
 CAMPAIGN_ID = "christmas-2026"
 # Europe/Paris: December 1 00:00 through January 1 00:00 (exclusive).
@@ -45,7 +46,7 @@ async def _status(db, user_id, now):
     start, end, enabled, approval = rows[0]
     active = bool(enabled and approval and start <= now < end)
     result = {"campaign": CAMPAIGN_ID, "active": active,
-              "starts_at": start, "ends_at": end}
+              "starts_at": start, "ends_at": end, "credit_type":"non_api"}
     if not active or user_id is None:
         return result
     rows = await db.execute_fetchall(
@@ -72,7 +73,6 @@ async def claim(user_id):
     status = await get_status(user_id)
     if not status.get("eligible"):
         raise GiftUnavailable("Gift unavailable for this account")
-    await credits.reset_free_daily_quota_if_needed(user_id)
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
@@ -80,26 +80,27 @@ async def claim(user_id):
         status = await _status(db,user_id,now)
         if not status.get("eligible"):
             raise GiftUnavailable("Gift unavailable for this account")
-        rows = await db.execute_fetchall("SELECT balance FROM credits WHERE user_id=?",(user_id,))
+        rows = await db.execute_fetchall("SELECT 1 FROM credits WHERE user_id=?",(user_id,))
         if not rows:
             raise GiftUnavailable("Credit account not found")
-        before = rows[0][0]
+        wallet = await db.execute_fetchall("SELECT balance FROM tool_credit_balances WHERE user_id=?",(user_id,))
+        before = wallet[0][0] if wallet else 0
         operation = f"{CAMPAIGN_ID}:{user_id}"
         seen = await credits._operation_seen(db,operation)
         if status["claimed"] or seen:
-            return {"ok":True,"already_claimed":True,"amount":status["amount"],"balance":before}
+            return {"ok":True,"already_claimed":True,"amount":status["amount"],"tool_credits":before,"credit_type":"non_api"}
         amount = status["amount"]
         after = before + amount
-        await db.execute("UPDATE credits SET balance=?,updated_at=? WHERE user_id=?",(after,now,user_id))
+        await db.execute("INSERT INTO tool_credit_balances(user_id,balance) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance",(user_id,after))
         await db.execute(
-            "INSERT INTO credit_transactions(user_id,delta,reason,metadata) VALUES(?,?,'promotional_gift',?)",
+            "INSERT INTO tool_credit_transactions(user_id,delta,reason,metadata) VALUES(?,?,'christmas_non_api_gift',?)",
             (user_id,amount,json.dumps({"campaign":CAMPAIGN_ID,"operation_key":operation,
                                        "balance_before":before,"balance_after":after})))
-        await credits._record_operation(db,operation,user_id,"promotional_gift")
+        await credits._record_operation(db,operation,user_id,"christmas_non_api_gift")
         await db.execute("UPDATE credit_campaign_recipients SET claimed_at=? WHERE campaign_id=? AND user_id=?",
                          (now,CAMPAIGN_ID,user_id))
         await db.commit()
-        return {"ok":True,"already_claimed":False,"amount":amount,"balance":after}
+        return {"ok":True,"already_claimed":False,"amount":amount,"tool_credits":after,"credit_type":"non_api"}
     except Exception:
         await db.rollback()
         raise

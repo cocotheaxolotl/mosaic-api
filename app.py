@@ -544,6 +544,9 @@ async def ai_image_generate(
     promo = _check_promo(promo_code)
 
     if user_id:
+        plan_info = await credits_module.get_plan_info(user_id)
+        if not plan_info or plan_info["plan_name"] == "free":
+            raise HTTPException(403, "AI images require a paid plan")
         balance = await credits_module.get_balance(user_id)
         if balance <= 0:
             raise HTTPException(
@@ -1367,8 +1370,13 @@ async def api_credits_consume(request: Request, req: ConsumeRequest):
     plan_info = await credits_module.get_plan_info(user_id)
     plan_name = (plan_info or {}).get("plan_name", "free")
 
+    cost = 1
+    if req.feature == "ai-image":
+        if plan_name == "free":
+            raise HTTPException(403, "AI images require a paid plan")
+        cost = _AI_QUALITY_CREDITS.get(req.variant, 1)
     success, remaining = await credits_module.consume_credits(
-        user_id, 1, "generation",
+        user_id, cost, "generation",
         metadata={"feature": req.feature, "variant": req.variant},
     )
     if not success:
@@ -1379,6 +1387,24 @@ async def api_credits_consume(request: Request, req: ConsumeRequest):
             "upgrade_url": "https://univers.studio/pricing/",
         })
     return {"ok": True, "remaining": remaining}
+
+
+class ToolDownloadRequest(BaseModel):
+    tool: str = ""
+    feature: str = "tool-download"
+    variant: str = ""
+
+
+@app.post("/api/credits/tools/consume")
+async def api_consume_browser_tool(request: Request, req: ToolDownloadRequest):
+    import tool_credits
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    result = await tool_credits.consume_download(user_id,req.tool,req.feature,req.variant)
+    if not result["ok"]:
+        raise HTTPException(402,result)
+    return result
 
 
 @app.get("/api/promotions/christmas-2026")
