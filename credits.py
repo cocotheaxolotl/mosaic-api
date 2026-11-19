@@ -141,27 +141,63 @@ async def consume_credits(
         await db.close()
 
 
+async def _operation_seen(db, operation_key: str | None) -> bool:
+    if not operation_key:
+        return False
+    return bool(await db.execute_fetchall(
+        "SELECT 1 FROM credit_operations WHERE operation_key=?", (operation_key,)))
+
+
+async def _record_operation(db, operation_key: str | None, user_id: int, kind: str):
+    if operation_key:
+        await db.execute("INSERT INTO credit_operations(operation_key,user_id,kind) VALUES(?,?,?)",
+                         (operation_key,user_id,kind))
+
+
+async def protected_extra_credits(db, user_id: int, balance: int) -> int:
+    # Subscription credits are spent before purchased packs. Never expire packs
+    # at a renewal; clamp to the real balance so legacy losses aren't backfilled.
+    rows = await db.execute_fetchall(
+        "SELECT delta, reason, metadata FROM credit_transactions WHERE user_id=? ORDER BY id",
+        (user_id,),
+    )
+    subscription, packs = 0, 0
+    for delta, reason, metadata in rows:
+        if reason in ("credit_pack_purchase", "customer_service_gift"):
+            packs += max(delta, 0)
+        elif reason in ("subscription_start", "subscription_renewal", "free_daily_reset", "trial_activation", "signup_bonus"):
+            try:
+                info = json.loads(metadata or "{}")
+            except (ValueError, TypeError):
+                info = {}
+            subscription = max(info.get("quota", delta), 0) if isinstance(info, dict) else max(delta, 0)
+        elif delta < 0:
+            used = min(subscription, -delta)
+            subscription -= used
+            packs = max(0, packs - (-delta - used))
+    return min(packs, max(balance, 0))
+
+
 async def add_credits(
-    user_id: int, amount: int, reason: str, metadata: dict | None = None
+    user_id: int, amount: int, reason: str, metadata: dict | None = None,
+    operation_key: str | None = None,
 ) -> int:
-    """Add credits to a user's balance. Returns new balance."""
+    """Add credits atomically; a paid Checkout session can be fulfilled once."""
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
-        rows = await db.execute_fetchall(
-            "SELECT balance FROM credits WHERE user_id = ?", (user_id,)
-        )
-        current = rows[0][0] if rows else 0
+        rows = await db.execute_fetchall("SELECT balance FROM credits WHERE user_id=?",(user_id,))
+        if not rows:
+            raise ValueError("Credit account not found")
+        current = rows[0][0]
+        if await _operation_seen(db,operation_key):
+            return current
         new_balance = current + amount
-
-        await db.execute(
-            "UPDATE credits SET balance = ?, updated_at = ? WHERE user_id = ?",
-            (new_balance, time.time(), user_id),
-        )
-        await db.execute(
-            "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, ?, ?)",
-            (user_id, amount, reason, json.dumps(metadata) if metadata else None),
-        )
+        await db.execute("UPDATE credits SET balance=?,updated_at=? WHERE user_id=?",
+                         (new_balance,time.time(),user_id))
+        await db.execute("INSERT INTO credit_transactions(user_id,delta,reason,metadata) VALUES(?,?,?,?)",
+                         (user_id,amount,reason,json.dumps(metadata) if metadata else None))
+        await _record_operation(db,operation_key,user_id,reason)
         await db.commit()
         return new_balance
     except Exception:
@@ -172,34 +208,43 @@ async def add_credits(
 
 
 async def set_plan(
-    user_id: int,
-    plan_name: str,
-    monthly_quota: int,
-    stripe_sub_id: str | None = None,
-    sub_status: str = "active",
-    current_period_end: float | None = None,
+    user_id: int, plan_name: str, monthly_quota: int,
+    stripe_sub_id: str | None = None, sub_status: str = "active",
+    current_period_end: float | None = None, operation_key: str | None = None,
 ) -> int:
-    """
-    Set a user's plan and credit their account with the monthly quota.
-    Returns new balance.
-    """
+    """Activate once, retaining purchased packs and approved service gifts."""
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
+        rows = await db.execute_fetchall("SELECT balance FROM credits WHERE user_id=?",(user_id,))
+        if not rows:
+            raise ValueError("Credit account not found")
+        before=rows[0][0]
+        if await _operation_seen(db,operation_key):
+            return before
+        # Legacy paid starts predate the operation ledger. A replay must not
+        # overwrite credits already consumed, purchased or gifted since then.
+        if operation_key and stripe_sub_id:
+            starts=await db.execute_fetchall(
+                "SELECT metadata FROM credit_transactions WHERE user_id=? AND reason='subscription_start'",(user_id,))
+            for raw, in starts:
+                try: info=json.loads(raw or "{}")
+                except (TypeError,ValueError): continue
+                if isinstance(info,dict) and info.get("stripe_sub_id")==stripe_sub_id:
+                    await _record_operation(db,operation_key,user_id,"legacy_subscription_start")
+                    await db.commit()
+                    return before
+        balance=monthly_quota+await protected_extra_credits(db,user_id,before)
         await db.execute(
-            "UPDATE credits SET plan_name = ?, monthly_quota = ?, balance = ?, "
-            "stripe_sub_id = ?, sub_status = ?, current_period_end = ?, updated_at = ? "
-            "WHERE user_id = ?",
-            (plan_name, monthly_quota, monthly_quota, stripe_sub_id,
-             sub_status, current_period_end, time.time(), user_id),
-        )
-        await db.execute(
-            "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, ?, ?)",
-            (user_id, monthly_quota, "subscription_start",
-             json.dumps({"plan": plan_name, "stripe_sub_id": stripe_sub_id})),
-        )
+            "UPDATE credits SET plan_name=?,monthly_quota=?,balance=?,stripe_sub_id=?,sub_status=?,current_period_end=?,updated_at=? WHERE user_id=?",
+            (plan_name,monthly_quota,balance,stripe_sub_id,sub_status,current_period_end,time.time(),user_id))
+        metadata={"plan":plan_name,"stripe_sub_id":stripe_sub_id,"quota":monthly_quota,
+                  "balance_before":before,"balance_after":balance,"operation_key":operation_key}
+        await db.execute("INSERT INTO credit_transactions(user_id,delta,reason,metadata) VALUES(?,?,?,?)",
+                         (user_id,balance-before,"subscription_start",json.dumps(metadata)))
+        await _record_operation(db,operation_key,user_id,"subscription_start")
         await db.commit()
-        return monthly_quota
+        return balance
     except Exception:
         await db.rollback()
         raise
@@ -207,30 +252,48 @@ async def set_plan(
         await db.close()
 
 
-async def renew_credits(user_id: int) -> int:
-    """Reset credits to monthly quota on subscription renewal. Returns new balance."""
+async def renew_credits(
+    user_id: int, operation_key: str | None = None,
+    stripe_sub_id: str | None = None, period_start: float | None = None,
+    period_end: float | None = None,
+) -> int:
+    """Renew once per paid invoice, preserving packs, gifts and Studio rollover."""
     db = await get_db()
     try:
         await db.execute("BEGIN IMMEDIATE")
-        rows = await db.execute_fetchall(
-            "SELECT monthly_quota, plan_name FROM credits WHERE user_id = ?",
-            (user_id,),
-        )
+        rows=await db.execute_fetchall(
+            "SELECT monthly_quota,plan_name,balance,stripe_sub_id FROM credits WHERE user_id=?",(user_id,))
         if not rows:
             return 0
-        quota = rows[0][0]
-        plan = rows[0][1]
-
-        await db.execute(
-            "UPDATE credits SET balance = ?, updated_at = ? WHERE user_id = ?",
-            (quota, time.time(), user_id),
-        )
-        await db.execute(
-            "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, ?, ?)",
-            (user_id, quota, "subscription_renewal", json.dumps({"plan": plan})),
-        )
+        quota,plan,before,current_sub=rows[0]
+        if stripe_sub_id and stripe_sub_id!=current_sub:
+            return before
+        if await _operation_seen(db,operation_key):
+            return before
+        if operation_key and period_start and period_end:
+            # Bootstrap invoices already fulfilled before this release, so a
+            # delayed retry cannot reset the same paid month's balance again.
+            previous=await db.execute_fetchall(
+                "SELECT metadata FROM credit_transactions WHERE user_id=? AND reason='subscription_renewal' AND created_at>=? AND created_at<?",
+                (user_id,period_start,period_end))
+            for raw, in previous:
+                try: info=json.loads(raw or "{}")
+                except (TypeError,ValueError): continue
+                if isinstance(info,dict) and info.get("stripe_sub_id",current_sub)==current_sub:
+                    await _record_operation(db,operation_key,user_id,"legacy_subscription_renewal")
+                    await db.commit()
+                    return before
+        balance=before+quota if plan=="studio" else quota+await protected_extra_credits(db,user_id,before)
+        await db.execute("UPDATE credits SET balance=?,updated_at=? WHERE user_id=?",(balance,time.time(),user_id))
+        metadata={"plan":plan,"stripe_sub_id":current_sub,"quota":quota,"balance_before":before,
+                  "balance_after":balance,"operation_key":operation_key}
+        if period_start:metadata["period_start"]=period_start
+        if period_end:metadata["period_end"]=period_end
+        await db.execute("INSERT INTO credit_transactions(user_id,delta,reason,metadata) VALUES(?,?,?,?)",
+                         (user_id,balance-before,"subscription_renewal",json.dumps(metadata)))
+        await _record_operation(db,operation_key,user_id,"subscription_renewal")
         await db.commit()
-        return quota
+        return balance
     except Exception:
         await db.rollback()
         raise

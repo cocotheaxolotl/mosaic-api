@@ -44,6 +44,13 @@ CREATE TABLE IF NOT EXISTS credit_transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_txn_user ON credit_transactions(user_id, created_at);
 
+CREATE TABLE IF NOT EXISTS credit_operations (
+    operation_key TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    kind TEXT NOT NULL,
+    created_at REAL NOT NULL DEFAULT (unixepoch())
+);
+
 CREATE TABLE IF NOT EXISTS annual_credit_policy (
     id INTEGER PRIMARY KEY CHECK (id=1),
     live_from REAL NOT NULL

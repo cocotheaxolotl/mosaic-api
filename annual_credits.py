@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 
 from database import get_db
+from credits import protected_extra_credits
 
 log = logging.getLogger(__name__)
 POLL_SECONDS = 300
@@ -40,30 +41,6 @@ def annual_term(subscription: dict):
     if not start or not end or end <= start:
         return None
     return int(start), int(end)
-
-
-async def _protected_packs(db, user_id: int, balance: int) -> int:
-    # Subscription credits are spent before purchased packs. Never expire packs
-    # at a renewal; clamp to the real balance so legacy losses aren't backfilled.
-    rows = await db.execute_fetchall(
-        "SELECT delta, reason, metadata FROM credit_transactions WHERE user_id=? ORDER BY id",
-        (user_id,),
-    )
-    subscription, packs = 0, 0
-    for delta, reason, metadata in rows:
-        if reason in ("credit_pack_purchase", "customer_service_gift"):
-            packs += max(delta, 0)
-        elif reason in ("subscription_start", "subscription_renewal", "free_daily_reset", "trial_activation", "signup_bonus"):
-            try:
-                info = json.loads(metadata or "{}")
-            except (ValueError, TypeError):
-                info = {}
-            subscription = max(info.get("quota", delta), 0) if isinstance(info, dict) else max(delta, 0)
-        elif delta < 0:
-            used = min(subscription, -delta)
-            subscription -= used
-            packs = max(0, packs - (-delta - used))
-    return min(packs, max(balance, 0))
 
 
 async def process_subscription(user_id: int, subscription: dict, now: float | None = None) -> list[dict]:
@@ -126,7 +103,7 @@ async def process_subscription(user_id: int, subscription: dict, now: float | No
                 action = "expired"
             else:
                 action = "granted"
-                balance = balance + quota if plan == "studio" else quota + await _protected_packs(db, user_id, balance)
+                balance = balance + quota if plan == "studio" else quota + await protected_extra_credits(db, user_id, balance)
                 metadata = {"plan": plan, "stripe_sub_id": sub_id, "period_start": period_start,
                             "period_end": period_end, "source": "annual_monthly", "quota": quota,
                             "balance_before": before, "balance_after": balance}

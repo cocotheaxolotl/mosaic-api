@@ -55,3 +55,23 @@ offline credit regression suite before an image can be rolled out.
 Approved service gifts use the `customer_service_gift` transaction reason.
 They remain separate from the monthly entitlement and are protected like packs
 at annual-plan monthly renewals. Subscription credits are consumed first.
+
+## Payment lifecycle protections
+
+`credit_operations` records paid Checkout sessions and invoice renewals in the
+same transaction as their credit changes. A duplicated completed/async event
+cannot fulfill the same session twice. Legacy subscription starts and current
+monthly grants are recognized when bootstrapping this ledger.
+
+Monthly invoice renewals retain packs and service gifts; Studio retains its
+unused subscription allowance as well. Old invoices cannot renew a later
+period, and invoice/state events for another subscription of the same customer
+cannot modify the current contract. Status events fetch Stripe's canonical
+state so delayed failures or cancellations cannot overwrite a newer state.
+These guards never cancel, refund or change a Stripe subscription.
+
+The production webhook must enable `checkout.session.async_payment_succeeded`
+and `checkout.session.async_payment_failed` in addition to the existing events.
+A completed but unpaid Checkout session waits for payment success. After a
+successful late payment, the session is fulfilled once. Do not replay old paid
+events as an audit: inspect invoices and the ledger in read-only mode instead.

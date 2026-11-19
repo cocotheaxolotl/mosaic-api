@@ -145,6 +145,16 @@ async def create_checkout_session(
     currency: 'usd' | 'eur'
     """
     currency = (currency or "usd").lower()
+    if plan_key in PLANS:
+        db=await get_db()
+        try:
+            current=await db.execute_fetchall("SELECT stripe_sub_id FROM credits WHERE user_id=?",(user_id,))
+        finally:
+            await db.close()
+        if current and current[0][0]:
+            subscription=await asyncio.to_thread(stripe.Subscription.retrieve,current[0][0])
+            if subscription.get("status") not in ("canceled","incomplete_expired"):
+                raise ValueError("You already have an active or pending subscription. Use Manage subscription to update your plan or payment method.")
     customer_id = await _get_or_create_customer(user_id, email)
     affiliate_ref = ref.strip().lower() if ref else ""
 
@@ -275,8 +285,13 @@ async def _record_affiliate_commission(affiliate_code: str, customer_id: str, su
 async def _record_affiliate_payout(customer_id: str, amount_cents: int, invoice_id: str | None):
     """If an active commission exists for this customer and within 6 months, record a 30% payout."""
     import time as _time
+    if not invoice_id:
+        return
     db = await get_db()
     try:
+        await db.execute("BEGIN IMMEDIATE")
+        if await db.execute_fetchall("SELECT 1 FROM affiliate_payouts WHERE invoice_id=?",(invoice_id,)):
+            return
         rows = await db.execute_fetchall(
             """SELECT id, affiliate_email, commission_rate, months_total, months_paid, started_at
                FROM affiliate_commissions
@@ -327,6 +342,14 @@ async def _fulfill_checkout_session(data: dict) -> dict:
     """Fulfill a paid Checkout Session after instant or async payment success."""
     user_id_str = data.get("metadata", {}).get("coco_user_id")
     customer_id = data.get("customer")
+    if user_id_str and customer_id:
+        db=await get_db()
+        try:
+            customer_rows=await db.execute_fetchall("SELECT stripe_customer_id FROM users WHERE id=?",(int(user_id_str),))
+        finally:
+            await db.close()
+        if not customer_rows or customer_rows[0][0] not in (None,customer_id):
+            return {"handled":True,"action":"customer_mismatch_ignored"}
 
     # Credit pack purchase (one-time payment)
     pack_key = data.get("metadata", {}).get("pack")
@@ -337,7 +360,8 @@ async def _fulfill_checkout_session(data: dict) -> dict:
             user_id,
             amount=pack["credits"],
             reason="credit_pack_purchase",
-            metadata=json.dumps({"pack": pack_key}),
+            metadata={"pack":pack_key,"checkout_session_id":data.get("id")},
+            operation_key="checkout:"+data["id"],
         )
         return {"handled": True, "action": "credit_pack_purchased", "pack": pack_key, "credits": pack["credits"]}
 
@@ -349,6 +373,12 @@ async def _fulfill_checkout_session(data: dict) -> dict:
         sub_id = data.get("subscription")
         affiliate_ref = (data.get("metadata", {}).get("affiliate_ref") or "").strip().lower()
 
+        # Confirm the canonical subscription before activating a paid session.
+        subscription=await asyncio.to_thread(stripe.Subscription.retrieve,sub_id)
+        if subscription.get("customer")!=customer_id or subscription.get("status") not in ("active","trialing"):
+            return {"handled":True,"action":"inactive_subscription_ignored"}
+        items=(subscription.get("items") or {}).get("data") or []
+        period_end=subscription.get("current_period_end") or (items[0].get("current_period_end") if items else None)
         # Update user's Stripe customer ID if needed
         db = await get_db()
         try:
@@ -366,7 +396,9 @@ async def _fulfill_checkout_session(data: dict) -> dict:
             plan_name=plan_key,
             monthly_quota=plan["credits"],
             stripe_sub_id=sub_id,
-            sub_status="active",
+            sub_status=subscription["status"],
+            current_period_end=period_end,
+            operation_key="checkout:"+data["id"],
         )
 
         # Record affiliate commission if a valid code was used
@@ -417,6 +449,8 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
                 if billing_reason == "subscription_cycle":
                     subscription_id = data.get("subscription") or (
                         ((data.get("parent") or {}).get("subscription_details") or {}).get("subscription"))
+                    if not subscription_id or not invoice_id:
+                        return {"handled":True,"action":"unscoped_invoice_ignored"}
                     subscription = None
                     if subscription_id:
                         subscription = await asyncio.to_thread(
@@ -440,8 +474,19 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
                             await db.close()
                         action = "stale_subscription_ignored"
                         if current and (not subscription_id or current[0][0] == subscription_id):
-                            await credits_module.renew_credits(user_id)
-                            action = "credits_renewed"
+                            item=items[0] if items else {}
+                            start=(subscription or {}).get("current_period_start") or item.get("current_period_start")
+                            end=(subscription or {}).get("current_period_end") or item.get("current_period_end")
+                            lines=(data.get("lines") or {}).get("data") or []
+                            invoice_starts=[line["period"]["start"] for line in lines
+                                            if line.get("period") and not line.get("proration")]
+                            if start and invoice_starts and max(invoice_starts)<start:
+                                action="stale_invoice_ignored"
+                            else:
+                                await credits_module.renew_credits(
+                                    user_id,operation_key="invoice:"+invoice_id,
+                                    stripe_sub_id=subscription_id,period_start=start,period_end=end)
+                                action = "credits_renewed"
                     await _record_affiliate_payout(customer_id, amount_paid, invoice_id)
                     return {"handled": True, "action": action}
                 elif billing_reason == "subscription_create":
@@ -449,45 +494,32 @@ async def handle_webhook(payload: bytes, sig_header: str) -> dict:
                     await _record_affiliate_payout(customer_id, amount_paid, invoice_id)
                     return {"handled": True, "action": "first_invoice_commission"}
 
-    elif event_type == "customer.subscription.updated":
-        customer_id = data.get("customer")
-        sub_status = data.get("status")
-        if customer_id:
-            user_id = await _find_user_by_customer(customer_id)
-            if user_id:
-                db = await get_db()
-                try:
-                    await db.execute(
-                        "UPDATE credits SET sub_status = ? WHERE user_id = ?",
-                        (sub_status, user_id),
-                    )
-                    await db.commit()
-                finally:
-                    await db.close()
-                return {"handled": True, "action": "subscription_updated", "status": sub_status}
-
-    elif event_type == "customer.subscription.deleted":
-        customer_id = data.get("customer")
-        if customer_id:
-            user_id = await _find_user_by_customer(customer_id)
-            if user_id:
-                await credits_module.cancel_plan(user_id)
-                return {"handled": True, "action": "subscription_canceled"}
-
-    elif event_type == "invoice.payment_failed":
-        customer_id = data.get("customer")
-        if customer_id:
-            user_id = await _find_user_by_customer(customer_id)
-            if user_id:
-                db = await get_db()
-                try:
-                    await db.execute(
-                        "UPDATE credits SET sub_status = 'past_due' WHERE user_id = ?",
-                        (user_id,),
-                    )
-                    await db.commit()
-                finally:
-                    await db.close()
-                return {"handled": True, "action": "payment_failed"}
+    elif event_type in ("customer.subscription.updated", "customer.subscription.deleted", "invoice.payment_failed"):
+        customer_id=data.get("customer")
+        subscription_id=(data.get("id") if event_type.startswith("customer.subscription.") else
+                         data.get("subscription") or (((data.get("parent") or {}).get("subscription_details") or {}).get("subscription")))
+        user_id=await _find_user_by_customer(customer_id) if customer_id else None
+        if user_id and subscription_id:
+            db=await get_db()
+            try:
+                current=await db.execute_fetchall("SELECT stripe_sub_id FROM credits WHERE user_id=?",(user_id,))
+            finally:
+                await db.close()
+            if not current or current[0][0]!=subscription_id:
+                return {"handled":True,"action":"stale_subscription_ignored"}
+            # Stripe events can arrive out of order: canonical state wins.
+            subscription=await asyncio.to_thread(stripe.Subscription.retrieve,subscription_id)
+            if subscription.get("customer")!=customer_id:
+                return {"handled":True,"action":"customer_mismatch_ignored"}
+            items=(subscription.get("items") or {}).get("data") or []
+            end=subscription.get("current_period_end") or (items[0].get("current_period_end") if items else None)
+            db=await get_db()
+            try:
+                await db.execute("UPDATE credits SET sub_status=?,current_period_end=? WHERE user_id=? AND stripe_sub_id=?",
+                                 (subscription["status"],end,user_id,subscription_id))
+                await db.commit()
+            finally:
+                await db.close()
+            return {"handled":True,"action":"subscription_status_synced","status":subscription["status"]}
 
     return {"handled": False, "event_type": event_type}
