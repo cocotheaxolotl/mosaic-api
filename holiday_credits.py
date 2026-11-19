@@ -28,6 +28,17 @@ CREATE TABLE IF NOT EXISTS credit_campaign_recipients (
     claimed_at REAL,
     PRIMARY KEY(campaign_id,user_id)
 );
+CREATE TABLE IF NOT EXISTS credit_campaign_email_invitations (
+    campaign_id TEXT NOT NULL REFERENCES credit_campaigns(id),
+    email TEXT NOT NULL COLLATE NOCASE,
+    amount INTEGER NOT NULL DEFAULT 10 CHECK(amount=10),
+    approved INTEGER NOT NULL DEFAULT 0 CHECK(approved IN (0,1)),
+    approval_reference TEXT,
+    bound_user_id INTEGER REFERENCES users(id),
+    claimed_at REAL,
+    PRIMARY KEY(campaign_id,email),
+    UNIQUE(campaign_id,bound_user_id)
+);
 INSERT OR IGNORE INTO credit_campaigns(id,starts_at,ends_at)
 VALUES('christmas-2026',1796079600,1798758000);
 """
@@ -54,6 +65,21 @@ async def _status(db, user_id, now):
         "JOIN users u ON u.id=r.user_id WHERE r.campaign_id=? AND r.user_id=? "
         "AND r.approved=1 AND r.email=u.email COLLATE NOCASE",
         (CAMPAIGN_ID,user_id))
+    if not rows:
+        # Existing gifts stay tied to their original account and address.
+        enrolled = await db.execute_fetchall(
+            "SELECT 1 FROM credit_campaign_recipients WHERE campaign_id=? AND user_id=?",
+            (CAMPAIGN_ID,user_id))
+        if not enrolled:
+            invitations = await db.execute_fetchall(
+                "SELECT i.amount FROM credit_campaign_email_invitations i JOIN users u "
+                "ON i.email=u.email COLLATE NOCASE WHERE i.campaign_id=? AND u.id=? "
+                "AND i.approved=1 AND i.approval_reference IS NOT NULL "
+                "AND (i.bound_user_id IS NULL OR i.bound_user_id=u.id)",
+                (CAMPAIGN_ID,user_id))
+            if invitations:
+                result.update(eligible=True,amount=invitations[0][0],claimed=False,invited=True)
+                return result
     result["eligible"] = bool(rows)
     if rows:
         result.update(amount=rows[0][0], claimed=rows[0][1] is not None)
@@ -90,6 +116,15 @@ async def claim(user_id):
         if status["claimed"] or seen:
             return {"ok":True,"already_claimed":True,"amount":status["amount"],"tool_credits":before,"credit_type":"non_api"}
         amount = status["amount"]
+        if status.get("invited"):
+            address = (await db.execute_fetchall("SELECT email FROM users WHERE id=?",(user_id,)))[0][0]
+            await db.execute(
+                "INSERT INTO credit_campaign_recipients(campaign_id,user_id,email,plan_name,amount,approved) "
+                "VALUES(?,?,?,'free',?,1)",(CAMPAIGN_ID,user_id,address,amount))
+            await db.execute(
+                "UPDATE credit_campaign_email_invitations SET bound_user_id=?,claimed_at=? "
+                "WHERE campaign_id=? AND email=? COLLATE NOCASE",
+                (user_id,now,CAMPAIGN_ID,address))
         after = before + amount
         await db.execute("INSERT INTO tool_credit_balances(user_id,balance) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET balance=excluded.balance",(user_id,after))
         await db.execute(

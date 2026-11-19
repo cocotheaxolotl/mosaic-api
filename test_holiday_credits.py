@@ -200,4 +200,61 @@ class HolidayCreditsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await tools.get_balance(1),100)
 
 
+
+    async def invite(self,approved=1):
+        await self.sql("UPDATE credit_campaigns SET enabled=1,approval_reference='offline-expanded-approval'")
+        await self.sql("INSERT INTO credit_campaign_email_invitations(campaign_id,email,amount,approved,approval_reference) VALUES(?,'GIFT@example.invalid',10,?,?)",(gifts.CAMPAIGN_ID,approved,'offline-named-list' if approved else None))
+
+    async def test_approved_email_invitation_allows_later_account_and_only_tool_wallet(self):
+        await self.sql("DELETE FROM credit_transactions");await self.sql("DELETE FROM credits");await self.sql("DELETE FROM users")
+        await self.invite()
+        self.assertEqual(await self.sql("SELECT * FROM credit_campaign_recipients"),[])
+        await self.sql("INSERT INTO users(id,email,password_hash) VALUES(1,'gift@example.invalid','unused')")
+        await self.sql("INSERT INTO credits(user_id,balance,monthly_quota,plan_name,sub_status) VALUES(1,3,3,'free','none')")
+        self.assertTrue((await gifts.get_status(1))['eligible'])
+        self.assertEqual(await self.sql("SELECT * FROM credit_campaign_recipients"),[])
+        result=await gifts.claim(1)
+        self.assertEqual(result['amount'],10);self.assertEqual(await tools.get_balance(1),10)
+        self.assertEqual(await credits.get_balance(1),3)
+        self.assertEqual((await self.sql("SELECT bound_user_id FROM credit_campaign_email_invitations"))[0][0],1)
+
+    async def test_invitation_needs_its_own_explicit_approval(self):
+        await self.invite(approved=0)
+        with self.assertRaises(gifts.GiftUnavailable):await gifts.claim(1)
+        await self.sql("UPDATE credit_campaign_email_invitations SET approved=1")
+        with self.assertRaises(gifts.GiftUnavailable):await gifts.claim(1)
+        self.assertEqual(await tools.get_balance(1),0)
+
+    async def test_email_invitation_cannot_be_claimed_under_another_address(self):
+        await self.invite();await self.sql("UPDATE users SET email='other@example.invalid'")
+        with self.assertRaises(gifts.GiftUnavailable):await gifts.claim(1)
+        self.assertEqual(await tools.get_balance(1),0)
+
+    async def test_invitation_concurrent_claims_only_credit_once(self):
+        await self.invite();results=await asyncio.gather(*(gifts.claim(1) for _ in range(6)))
+        self.assertEqual(sum(not r['already_claimed'] for r in results),1)
+        self.assertEqual(await tools.get_balance(1),10)
+        self.assertEqual(len(await self.sql("SELECT * FROM tool_credit_transactions")),1)
+
+    async def test_reusing_invited_address_cannot_claim_again(self):
+        await self.invite();await gifts.claim(1)
+        await self.sql("UPDATE users SET email='changed@example.invalid' WHERE id=1")
+        await self.sql("INSERT INTO users(id,email,password_hash) VALUES(2,'gift@example.invalid','unused')")
+        await self.sql("INSERT INTO credits(user_id,balance,monthly_quota,plan_name,sub_status) VALUES(2,3,3,'free','none')")
+        with self.assertRaises(gifts.GiftUnavailable):await gifts.claim(2)
+        with self.assertRaises(gifts.GiftUnavailable):await gifts.claim(1)
+        self.assertEqual(await tools.get_balance(2),0)
+
+    async def test_existing_paid_gift_takes_priority_over_email_invitation(self):
+        await self.authorize(25);await self.invite();result=await gifts.claim(1)
+        self.assertEqual(result['amount'],25);self.assertEqual(await tools.get_balance(1),25)
+        self.assertIsNone((await self.sql("SELECT bound_user_id FROM credit_campaign_email_invitations"))[0][0])
+
+    async def test_invitation_does_not_bypass_december_boundaries(self):
+        await self.invite()
+        for instant in (gifts.STARTS_AT-1,gifts.ENDS_AT):
+            with patch.object(gifts,'_now',return_value=instant):
+                with self.assertRaises(gifts.GiftUnavailable):await gifts.claim(1)
+        self.assertEqual(await tools.get_balance(1),0)
+
 if __name__=='__main__':unittest.main()
