@@ -130,6 +130,25 @@ class RenewalTests(unittest.IsolatedAsyncioTestCase):
         await self.process()
         self.assertEqual(await self.balance(),200)
 
+    async def test_service_gift_survives_monthly_renewals_and_usage(self):
+        await credits.add_credits(1,100,"customer_service_gift")
+        await self.process()
+        self.assertEqual(await self.balance(),200)
+        ok,_=await credits.consume_credits(1,80,"generation")
+        self.assertTrue(ok)
+        self.now=ts("2026-12-19T12:00:00")
+        await self.process()
+        self.assertEqual(await self.balance(),200)
+
+    async def test_service_gift_is_only_spent_after_monthly_credits(self):
+        await self.process()
+        await credits.add_credits(1,100,"customer_service_gift")
+        ok,_=await credits.consume_credits(1,140,"generation")
+        self.assertTrue(ok)
+        self.now=ts("2026-12-19T12:00:00")
+        await self.process()
+        self.assertEqual(await self.balance(),160)
+
     async def test_concurrent_purchase_and_renewal_preserve_both(self):
         await asyncio.gather(self.process(),credits.add_credits(1,100,"credit_pack_purchase"))
         self.assertEqual(await self.balance(),200)

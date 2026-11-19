@@ -51,7 +51,7 @@ async def _protected_packs(db, user_id: int, balance: int) -> int:
     )
     subscription, packs = 0, 0
     for delta, reason, metadata in rows:
-        if reason == "credit_pack_purchase":
+        if reason in ("credit_pack_purchase", "customer_service_gift"):
             packs += max(delta, 0)
         elif reason in ("subscription_start", "subscription_renewal", "free_daily_reset", "trial_activation", "signup_bonus"):
             try:

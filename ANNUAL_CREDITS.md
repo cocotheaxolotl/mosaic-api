@@ -51,3 +51,7 @@ Builds use `constraints-production.txt`, captured from the working production
 image, so a credit fix does not silently upgrade unrelated runtime packages.
 `httpx` is a direct application dependency. Docker imports the app and runs the
 offline credit regression suite before an image can be rolled out.
+
+Approved service gifts use the `customer_service_gift` transaction reason.
+They remain separate from the monthly entitlement and are protected like packs
+at annual-plan monthly renewals. Subscription credits are consumed first.
