@@ -78,7 +78,7 @@ async def reset_free_daily_quota_if_needed(user_id: int) -> int | None:
         if not should_repair_quota and not should_reset_balance:
             return balance
 
-        new_balance = quota if should_reset_balance else balance
+        new_balance = (quota + await protected_extra_credits(db, user_id, balance)) if should_reset_balance else balance
         await db.execute(
             "UPDATE credits SET balance = ?, monthly_quota = ?, updated_at = ? WHERE user_id = ?",
             (new_balance, quota, time.time(), user_id),
@@ -163,9 +163,9 @@ async def protected_extra_credits(db, user_id: int, balance: int) -> int:
     )
     subscription, packs = 0, 0
     for delta, reason, metadata in rows:
-        if reason in ("credit_pack_purchase", "customer_service_gift"):
+        if reason in ("credit_pack_purchase", "customer_service_gift", "promotional_gift"):
             packs += max(delta, 0)
-        elif reason in ("subscription_start", "subscription_renewal", "free_daily_reset", "trial_activation", "signup_bonus"):
+        elif reason in ("subscription_start", "subscription_renewal", "free_daily_reset", "trial_activation", "signup_bonus", "trial_expired"):
             try:
                 info = json.loads(metadata or "{}")
             except (ValueError, TypeError):
@@ -362,5 +362,30 @@ async def get_transaction_history(user_id: int, limit: int = 50) -> list[dict]:
             }
             for r in rows
         ]
+    finally:
+        await db.close()
+
+
+async def expire_trial_if_needed(user_id: int):
+    db = await get_db()
+    try:
+        await db.execute("BEGIN IMMEDIATE")
+        rows = await db.execute_fetchall(
+            "SELECT c.balance FROM credits c WHERE c.user_id=? AND c.sub_status='trial' "
+            "AND EXISTS(SELECT 1 FROM trial_codes t WHERE t.used_by=c.user_id AND t.expires_at<?)",
+            (user_id,time.time()))
+        if not rows:
+            return
+        before = rows[0][0]
+        balance = FREE_DAILY_QUOTA + await protected_extra_credits(db,user_id,before)
+        await db.execute(
+            "UPDATE credits SET plan_name='free',balance=?,monthly_quota=?,sub_status='none',updated_at=? WHERE user_id=?",
+            (balance,FREE_DAILY_QUOTA,time.time(),user_id))
+        await db.execute("INSERT INTO credit_transactions(user_id,delta,reason,metadata) VALUES(?,?,'trial_expired',?)",
+                         (user_id,balance-before,json.dumps({"quota":FREE_DAILY_QUOTA,"balance_before":before,"balance_after":balance})))
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     finally:
         await db.close()

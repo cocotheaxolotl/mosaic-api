@@ -1304,28 +1304,8 @@ async def api_me(request: Request):
     if not user_id:
         raise HTTPException(401, "Not authenticated")
 
-    # Check for expired trial — auto-downgrade to free
-    import time as _time
-    db = await get_db()
-    try:
-        trial_rows = await db.execute_fetchall(
-            """SELECT tc.id FROM trial_codes tc
-               JOIN credits c ON c.user_id = tc.used_by
-               WHERE tc.used_by = ? AND tc.expires_at < ? AND c.sub_status = 'trial'""",
-            (user_id, _time.time()),
-        )
-        if trial_rows:
-            await db.execute(
-                "UPDATE credits SET plan_name = 'free', balance = 3, monthly_quota = 3, sub_status = 'none' WHERE user_id = ?",
-                (user_id,),
-            )
-            await db.execute(
-                "INSERT INTO credit_transactions (user_id, delta, reason, metadata) VALUES (?, ?, ?, ?)",
-                (user_id, 0, "trial_expired", "{}"),
-            )
-            await db.commit()
-    finally:
-        await db.close()
+    # Expiring a trial must retain purchased packs and owner-approved gifts.
+    await credits_module.expire_trial_if_needed(user_id)
 
     profile = await auth_module.get_me(user_id)
     if not profile:
@@ -1399,6 +1379,29 @@ async def api_credits_consume(request: Request, req: ConsumeRequest):
             "upgrade_url": "https://univers.studio/pricing/",
         })
     return {"ok": True, "remaining": remaining}
+
+
+@app.get("/api/promotions/christmas-2026")
+async def api_christmas_gift(request: Request):
+    import holiday_credits
+    user_id, _ = await get_user_or_ip(request)
+    if request.headers.get("Authorization") and not user_id:
+        raise HTTPException(401, "Session expired")
+    response = JSONResponse(await holiday_credits.get_status(user_id))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/api/promotions/christmas-2026/claim")
+async def api_claim_christmas_gift(request: Request):
+    import holiday_credits
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        return await holiday_credits.claim(user_id)
+    except holiday_credits.GiftUnavailable as exc:
+        raise HTTPException(403, str(exc))
 
 
 # ── Billing endpoints ─────────────────────────────────────────────────────

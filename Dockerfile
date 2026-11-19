@@ -15,7 +15,7 @@ COPY . .
 
 # Fail the build before rollout if imports or credit regressions fail.
 RUN python -c "import app; import annual_credits" \
-    && python -m unittest -q test_annual_credits test_billing_lifecycle
+    && python -m unittest -q test_annual_credits test_billing_lifecycle test_holiday_credits
 
 EXPOSE 8000
 
