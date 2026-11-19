@@ -198,6 +198,8 @@ async def init_db():
         await db.executescript(SCHEMA_SQL)
         from holiday_credits import SCHEMA_SQL as HOLIDAY_SCHEMA_SQL
         await db.executescript(HOLIDAY_SCHEMA_SQL)
+        from holiday_credits import migrate_ten_credit_gifts
+        await migrate_ten_credit_gifts(db)
         from tool_credits import SCHEMA_SQL as TOOL_CREDIT_SCHEMA_SQL
         await db.executescript(TOOL_CREDIT_SCHEMA_SQL)
         # Migration: add affiliate_ref column if missing (existing databases)

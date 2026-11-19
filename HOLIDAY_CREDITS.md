@@ -3,7 +3,7 @@
 The campaign is disabled by default with zero enrolled recipients. Deployment does not authorize or grant gifts.
 
 - Redemption: December 1, 2026 00:00 to January 1, 2027 00:00 exclusive, Europe/Paris.
-- Amounts: free 15, Creator 25, Pro 100, Studio 300. Paid quantities are 25% of ONE MONTH even for annual and former subscriptions.
+- Amounts: free 10, Creator 25, Pro 100, Studio 300. Paid quantities are 25% of ONE MONTH even for annual and former subscriptions.
 - Gifts go only to tool_credit_balances, with tool_credit_transactions and a unique credit_operations receipt. They NEVER increase credits.balance, monthly_quota, subscription dates or paid AI allowance.
 - No automatic enrollment, extension, invoice, charge, price change or extra email.
 - Approved browser exports: maze, sudoku, wordsearch, crossword, bingo, cryptogram, handwriting, mathdrills, back-matter, book-template, qr-code. One credit per export. Unknown or AI routes cannot spend this wallet.
@@ -16,4 +16,15 @@ The campaign is disabled by default with zero enrolled recipients. Deployment do
 
 Tool gift usage makes no paid provider call. This does not guarantee an unchanged total business bill: hosting and ordinary AI usage remain separate.
 
-Validation: python -m unittest -q test_annual_credits test_billing_lifecycle test_holiday_credits
+Validation: python -m unittest -q test_annual_credits test_billing_lifecycle test_holiday_credits test_flipbook_credits
+
+
+## Basic flipbook metering
+
+Owner confirmed: ten tool credits for free accounts, and enforce the existing displayed ten-credit basic price on paid subscriptions.
+
+GET/POST /api/credits/tools/flipbook authenticate the account. The server fixes the cost at ten; it uses a sufficient tool wallet first, otherwise a sufficient ordinary balance for Creator/Pro/Studio. Free ordinary/daily credits cannot pay for a flipbook. No split across insufficient balances. Plan, quota, Stripe subscription and dates are unchanged.
+
+The browser prepares the whole PDF and standalone HTML first, then posts only SHA256 and an operation UUID. tool_credit_artifacts has unique keys per account/operation and account/artifact, so concurrency, acknowledgement loss and identical-file reopening cannot debit twice. Ledger updates and the receipt commit atomically. A failed receipt rolls back the debit. The browser always offers a download even if popups are blocked.
+
+The old recipient CHECK is widened atomically to retain all existing 15-credit approvals while accepting the new ten-credit gift. No recipients or balances are added by migration. Legacy partner trials/VIP gifts stay on their existing exempt path. Audio/video fees are outside this basic-price change.

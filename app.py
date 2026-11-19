@@ -1407,6 +1407,37 @@ async def api_consume_browser_tool(request: Request, req: ToolDownloadRequest):
     return result
 
 
+class FlipbookCreditRequest(BaseModel):
+    operation_id: str
+    artifact_hash: str
+
+
+@app.get("/api/credits/tools/flipbook")
+async def api_flipbook_access(request: Request):
+    import tool_credits
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        response=JSONResponse(await tool_credits.flipbook_access(user_id))
+        response.headers["Cache-Control"]="no-store"
+        return response
+    except tool_credits.FlipbookCreditError as exc:
+        raise HTTPException(exc.status,str(exc))
+
+
+@app.post("/api/credits/tools/flipbook")
+async def api_consume_basic_flipbook(request: Request, req: FlipbookCreditRequest):
+    import tool_credits
+    user_id, _ = await get_user_or_ip(request)
+    if not user_id:
+        raise HTTPException(401, "Not authenticated")
+    try:
+        return await tool_credits.consume_flipbook(user_id,req.operation_id,req.artifact_hash)
+    except tool_credits.FlipbookCreditError as exc:
+        raise HTTPException(exc.status,str(exc))
+
+
 @app.get("/api/promotions/christmas-2026")
 async def api_christmas_gift(request: Request):
     import holiday_credits

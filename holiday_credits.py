@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS credit_campaign_recipients (
     user_id INTEGER NOT NULL REFERENCES users(id),
     email TEXT NOT NULL COLLATE NOCASE,
     plan_name TEXT NOT NULL,
-    amount INTEGER NOT NULL CHECK(amount IN (15,25,100,300)),
+    amount INTEGER NOT NULL CHECK(amount IN (10,15,25,100,300)),
     approved INTEGER NOT NULL DEFAULT 0 CHECK(approved IN (0,1)),
     claimed_at REAL,
     PRIMARY KEY(campaign_id,user_id)
@@ -106,3 +106,28 @@ async def claim(user_id):
         raise
     finally:
         await db.close()
+
+
+async def migrate_ten_credit_gifts(db):
+    """Widen the old CHECK atomically, preserving every approval/receipt."""
+    rows=await db.execute_fetchall("SELECT sql FROM sqlite_master WHERE type='table' AND name='credit_campaign_recipients'")
+    if not rows or 'IN(15,25,100,300)' not in rows[0][0].replace(' ','').replace('\n',''):
+        return
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        await db.execute("""CREATE TABLE credit_campaign_recipients_new (
+            campaign_id TEXT NOT NULL REFERENCES credit_campaigns(id),
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            email TEXT NOT NULL COLLATE NOCASE,
+            plan_name TEXT NOT NULL,
+            amount INTEGER NOT NULL CHECK(amount IN (10,15,25,100,300)),
+            approved INTEGER NOT NULL DEFAULT 0 CHECK(approved IN (0,1)),
+            claimed_at REAL,
+            PRIMARY KEY(campaign_id,user_id))""")
+        await db.execute("INSERT INTO credit_campaign_recipients_new SELECT * FROM credit_campaign_recipients")
+        await db.execute("DROP TABLE credit_campaign_recipients")
+        await db.execute("ALTER TABLE credit_campaign_recipients_new RENAME TO credit_campaign_recipients")
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
