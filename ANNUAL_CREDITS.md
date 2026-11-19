@@ -75,3 +75,11 @@ and `checkout.session.async_payment_failed` in addition to the existing events.
 A completed but unpaid Checkout session waits for payment success. After a
 successful late payment, the session is fulfilled once. Do not replay old paid
 events as an audit: inspect invoices and the ledger in read-only mode instead.
+
+## Studio quota correction (2026-11-19)
+
+The public Studio contract and new activations grant 1,200 monthly credits.
+Existing accounts store their own monthly quota: changing the public catalog
+alone does not rewrite those rows or reclaim existing credit balances. Review
+the named active Studio accounts before updating their stored future quota.
+Administrative overrides and canceled accounts must not be changed implicitly.

@@ -181,6 +181,16 @@ class BillingLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.balance(),0)
         self.assertEqual((await self.sql("SELECT stripe_customer_id FROM users"))[0][0],"cus_test")
 
+    async def test_public_studio_contract_is_1200_credits(self):
+        studio=next(p for p in billing.get_plans_public() if p['key']=='studio')
+        self.assertEqual(studio['credits'],1200)
+
+    async def test_new_studio_checkout_activates_1200_credits(self):
+        data=self.checkout();data['metadata']['plan']='studio'
+        await self.event('checkout.session.completed',data)
+        row=(await self.sql('SELECT plan_name,monthly_quota,balance FROM credits WHERE user_id=1'))[0]
+        self.assertEqual(tuple(row),('studio',1200,1200))
+
     async def test_duplicate_affiliate_invoice_cannot_record_a_second_payout(self):
         import time
         await self.sql("INSERT INTO affiliate_commissions(affiliate_email,affiliate_name,affiliate_code,customer_id,started_at) VALUES('affiliate@example.invalid','Test','code','cus_test',?)",(time.time(),))

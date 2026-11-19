@@ -47,7 +47,7 @@ PLANS = {
             "monthly_eur": os.environ.get("STRIPE_PRICE_STUDIO_MONTHLY_EUR", ""),
             "annual_eur": os.environ.get("STRIPE_PRICE_STUDIO_ANNUAL_EUR", ""),
         },
-        "credits": 1500,
+        "credits": 1200,
         "label": "Studio",
         "price_display": "$79",
     },
