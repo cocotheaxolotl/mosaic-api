@@ -46,3 +46,8 @@ the live source hashes and the ledger status counts. A pending historical
 period is not a repaired customer balance: verify corrections separately after
 explicit customer-by-customer approval. Avoid logging tokens or publishing
 client-level audit exports in this repository.
+
+Builds use `constraints-production.txt`, captured from the working production
+image, so a credit fix does not silently upgrade unrelated runtime packages.
+`httpx` is a direct application dependency. Docker imports the app and runs the
+offline credit regression suite before an image can be rolled out.
